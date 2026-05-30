@@ -1,6 +1,6 @@
 module github.com/askerdev/bitstar
 
-go 1.26.3
+go 1.25.0
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.18.2

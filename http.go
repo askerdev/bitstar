@@ -2,9 +2,9 @@ package bitstar
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"slices"
-	"strconv"
 	"sync"
 	"time"
 
@@ -37,9 +37,7 @@ func NewHandler() *Handler {
 	}
 
 	h.mux.HandleFunc("POST /v1/events:batchCreate", h.batchCreate())
-	h.mux.HandleFunc("POST /v1/events", h.create())
 	h.mux.HandleFunc("GET /v1/events", h.list())
-	h.mux.HandleFunc("DELETE /v1/events/{id}", h.delete())
 
 	return h
 }
@@ -49,6 +47,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) batchCreate() http.HandlerFunc {
+	type CreateEventRequest struct {
+		Event *Event `json:"event"`
+	}
+
 	type BatchCreateEventRequest struct {
 		Requests []CreateEventRequest `json:"requests"`
 	}
@@ -59,8 +61,7 @@ func (h *Handler) batchCreate() http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		var batchRequest BatchCreateEventRequest
-		if err := json.NewDecoder(r.Body).Decode(&batchRequest); err != nil {
-			http.Error(w, "failed to decode request", http.StatusBadRequest)
+		if err := readJSON(w, r, &batchRequest); err != nil {
 			return
 		}
 
@@ -96,67 +97,9 @@ func (h *Handler) batchCreate() http.HandlerFunc {
 			events = append(events, request.Event)
 		}
 
-		response := &BatchCreateEventResponse{
+		writeJSON(w, http.StatusCreated, &BatchCreateEventResponse{
 			Events: events,
-		}
-
-		if err := json.NewEncoder(w).Encode(&response); err != nil {
-			http.Error(w, "failed to encode response", http.StatusInternalServerError)
-			return
-		}
-	}
-}
-
-type CreateEventRequest struct {
-	Event *Event `json:"event"`
-}
-
-type CreateEventResponse struct {
-	Event *Event `json:"event"`
-}
-
-func (h *Handler) create() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var request CreateEventRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			http.Error(w, "failed to decode request", http.StatusBadRequest)
-			return
-		}
-
-		h.mutex.Lock()
-		defer h.mutex.Unlock()
-
-		request.Event.ID = h.sequence
-		h.sequence++
-
-		h.storage[request.Event.ID] = request.Event
-
-		h.startTime.SetValue(uint64(request.Event.ID), request.Event.StartTime.Unix())
-		h.endTime.SetValue(uint64(request.Event.ID), request.Event.EndTime.Unix())
-
-		for _, tag := range request.Event.Tags {
-			if _, ok := h.tags[tag]; !ok {
-				h.tags[tag] = roaring.New()
-			}
-			h.tags[tag].Add(request.Event.ID)
-		}
-
-		for key, value := range request.Event.Annotations {
-			pair := Pair{Key: key, Value: value}
-			if _, ok := h.annotations[pair]; !ok {
-				h.annotations[pair] = roaring.New()
-			}
-			h.annotations[pair].Add(request.Event.ID)
-		}
-
-		response := &CreateEventResponse{
-			Event: request.Event,
-		}
-
-		if err := json.NewEncoder(w).Encode(&response); err != nil {
-			http.Error(w, "failed to encode response", http.StatusInternalServerError)
-			return
-		}
+		})
 	}
 }
 
@@ -173,8 +116,7 @@ func (h *Handler) list() http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		var request ListEventsRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			http.Error(w, "failed to decode request", http.StatusBadRequest)
+		if err := readJSON(w, r, &request); err != nil {
 			return
 		}
 
@@ -237,53 +179,29 @@ func (h *Handler) list() http.HandlerFunc {
 			return 1
 		})
 
-		response := ListEventsResponse{
+		writeJSON(w, http.StatusOK, &ListEventsResponse{
 			Events: events,
-		}
-
-		if err := json.NewEncoder(w).Encode(&response); err != nil {
-			http.Error(w, "failed to encode response", http.StatusInternalServerError)
-			return
-		}
+		})
 	}
 }
 
-func (h *Handler) delete() http.HandlerFunc {
-	type DeleteEventRequest struct {
+func readJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	if err := json.NewDecoder(r.Body).Decode(&dst); err != nil {
+		http.Error(w, "failed to decode request", http.StatusBadRequest)
+		return fmt.Errorf("failed to decode request")
 	}
+	return nil
+}
 
-	type DeleteEventResponse struct {
+func writeJSON(w http.ResponseWriter, statusCode int, data any) {
+	w.WriteHeader(statusCode)
+	if data == nil {
+		return
 	}
-
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, err := strconv.ParseUint(r.PathValue("id"), 10, 32)
-		if err != nil {
-			http.Error(w, "invalid id", http.StatusBadRequest)
-			return
-		}
-
-		h.mutex.Lock()
-		defer h.mutex.Unlock()
-
-		event, ok := h.storage[uint32(id)]
-		if ok {
-			for _, tag := range event.Tags {
-				h.tags[tag].Remove(event.ID)
-			}
-
-			for key, value := range event.Annotations {
-				pair := Pair{Key: key, Value: value}
-				h.annotations[pair].Remove(event.ID)
-			}
-
-			delete(h.storage, event.ID)
-		}
-
-		response := &DeleteEventResponse{}
-
-		if err := json.NewEncoder(w).Encode(&response); err != nil {
-			http.Error(w, "failed to encode response", http.StatusInternalServerError)
-			return
-		}
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+		return
 	}
+	w.Write(bytes)
 }
