@@ -1,0 +1,45 @@
+{
+  "requests": [
+    {
+      "event": {
+        "title": "event 0",
+        "start_time": "2026-05-30T17:30:00.000Z",
+        "end_time": "2026-05-30T18:30:00.000Z",
+        "tags": [
+          "tag1"
+        ],
+        "annotations": {
+          "first": "true"
+        }
+      }
+    },
+    {
+      "event": {
+        "title": "event 1",
+        "start_time": "2026-05-30T17:25:00.000Z",
+        "end_time": "2026-05-30T17:45:00.000Z",
+        "tags": [
+          "tag1",
+          "tag2"
+        ],
+        "annotations": {
+          "first": "true",
+          "second": "true"
+        }
+      }
+    },
+    {
+      "event": {
+        "title": "event 2",
+        "start_time": "2026-05-30T16:30:00.000Z",
+        "end_time": "2026-05-30T17:30:00.000Z",
+        "tags": [
+          "tag2"
+        ],
+        "annotations": {
+          "second": "true"
+        }
+      }
+    }
+  ]
+}

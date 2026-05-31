@@ -1,0 +1,38 @@
+{
+  "start_time": "2026-01-01T00:00:00.000Z",
+  "end_time": "2026-04-01T00:00:00.000Z",
+  "filter": {
+    "and": [
+      {
+        "or": [
+          {
+            "annotation": {
+              "key": "type",
+              "value": "issue"
+            }
+          }
+        ]
+      },
+      {
+        "or": [
+          {
+            "annotation": {
+              "key": "severity",
+              "value": "major"
+            }
+          }
+        ]
+      },
+      {
+        "or": [
+          {
+            "annotation": {
+              "key": "service_id",
+              "value": "65"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

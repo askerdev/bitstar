@@ -2,10 +2,12 @@ package bitstar
 
 import (
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type Event struct {
-	ID          uint32            `json:"id"`
+	ID          uuid.UUID         `json:"id"`
 	Title       string            `json:"title"`
 	Description string            `json:"description"`
 	StartTime   time.Time         `json:"start_time"`

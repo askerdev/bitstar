@@ -1,64 +1,63 @@
 package bitstar
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"path/filepath"
+	"runtime"
 	"slices"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/askerdev/bitstar/bsi"
-	"github.com/dgraph-io/badger/v4"
+	"github.com/askerdev/bitstar/wal"
+	"github.com/dgraph-io/badger/v4/skl"
+	"github.com/dgraph-io/badger/v4/y"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
 type Handler struct {
 	log *zap.SugaredLogger
+	mux *http.ServeMux
+	skl *skl.Skiplist
 
-	mutex *sync.RWMutex
-
-	storage     *badger.DB
 	startTime   *bsi.BSI
 	endTime     *bsi.BSI
 	tags        map[string]*roaring.Bitmap
 	annotations map[Pair]*roaring.Bitmap
 
-	mux *http.ServeMux
+	keys    map[uint32][]byte
+	indexes map[string]uint32
+
+	wal *wal.WAL
 }
 
-func NewHandler(
-	log *zap.SugaredLogger,
-) *Handler {
-	opts := badger.DefaultOptions("badger").
-		WithLogger(&BadgerZapAdapter{Sugar: log})
-
-	db, err := badger.Open(opts)
-	if err != nil {
-		panic(err)
-	}
-
+func NewHandler(log *zap.SugaredLogger, walDir string) *Handler {
 	h := &Handler{
 		log:         log,
 		mux:         http.NewServeMux(),
-		mutex:       &sync.RWMutex{},
-		storage:     db,
+		skl:         skl.NewSkiplist(8192 << 20),
 		startTime:   bsi.NewDefaultBSI(),
 		endTime:     bsi.NewDefaultBSI(),
 		tags:        make(map[string]*roaring.Bitmap),
 		annotations: make(map[Pair]*roaring.Bitmap),
+		keys:        make(map[uint32][]byte),
+		indexes:     make(map[string]uint32),
+		wal:         wal.Must(wal.New(filepath.Join(walDir, "wal"))),
 	}
 
-	if err := h.indexEvents(); err != nil {
+	if err := h.recover(); err != nil {
 		panic(err)
 	}
 
 	h.mux.HandleFunc("POST /v1/events:batchCreate", h.batchCreate())
 	h.mux.HandleFunc("GET /v1/events", h.list())
+	h.mux.HandleFunc("GET /v1/index", h.index())
 
 	return h
 }
@@ -83,86 +82,98 @@ func (h *Handler) batchCreate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var batchRequest BatchCreateEventRequest
 		if err := readJSON(w, r, &batchRequest); err != nil {
+			h.log.Error(err)
 			return
 		}
 
-		h.log.Debug("recv batch create events request", "len", len(batchRequest.Requests))
-
 		events := make([]*Event, 0, len(batchRequest.Requests))
-
-		seq, err := h.storage.GetSequence([]byte("seq_events"), 1000)
-		defer seq.Release()
-
-		err = func() error {
-			txn := h.storage.NewTransaction(true)
+		err := traceErr(h.log, "batchCreate", func() error {
 			for _, request := range batchRequest.Requests {
-				id, err := seq.Next()
-				if err != nil {
-					return err
-				}
-				request.Event.ID = uint32(id)
+				request.Event.ID = uuid.Must(uuid.NewV7())
 
-				key := eventKey(request.Event.ID)
-				value, err := json.Marshal(request.Event)
-				if err != nil {
-					return err
-				}
+				key := encodeKey(request.Event.StartTime, request.Event.ID)
+				value := encodeEvent(request.Event)
 
-				if err := txn.Set(key, value); errors.Is(err, badger.ErrTxnTooBig) {
-					if err := txn.Commit(); err != nil {
-						return err
-					}
+				entry := make([]byte, len(key)+4+len(value))
+				copy(entry[0:24], key)
+				binary.BigEndian.PutUint32(entry[24:24+4], uint32(len(value)))
+				copy(entry[24+4:], value)
 
-					txn = h.storage.NewTransaction(true)
-
-					if err := txn.Set(key, value); err != nil {
-						return err
-					}
-				} else if err != nil {
+				if err := h.wal.Append(entry); err != nil {
 					return err
 				}
 
-				h.indexEventLock(request.Event)
+				// TODO: first write all entries to WAL, only then
+				// write to memory. Handle transactionally and truncate
+				// batch in WAL if error occured while writing to WAL.
+				// Important for idempotency guarantees
+				h.skl.Put(key, y.ValueStruct{
+					Value:    value,
+					Meta:     0,
+					UserMeta: 0,
+				})
 
 				events = append(events, request.Event)
 			}
-			return txn.Commit()
-		}()
+
+			return h.wal.Sync()
+		})
 		if err != nil {
-			h.log.Error("storage update fail", "err", err)
-			http.Error(w, "storage update fail", http.StatusInternalServerError)
+			h.log.Errorw("batch create fail", "err", err)
+			http.Error(w, "batch create fail", http.StatusInternalServerError)
 			return
 		}
 
-		writeJSON(w, http.StatusCreated, &BatchCreateEventResponse{
+		h.writeJSON(w, http.StatusCreated, &BatchCreateEventResponse{
 			Events: events,
 		})
+
+		runtime.GC()
 	}
 }
 
-func (h *Handler) list() http.HandlerFunc {
-	type ListEventsRequest struct {
-		StartTime time.Time `json:"start_time"`
-		EndTime   time.Time `json:"end_time"`
-		Filter    Filter    `json:"filter"`
-	}
+type ListEventsRequest struct {
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+	PageToken string    `json:"page_token"`
+	PageSize  int       `json:"page_size"`
+	Filter    Filter    `json:"filter"`
+}
 
+func (h *Handler) list() http.HandlerFunc {
 	type ListEventsResponse struct {
-		Events []*Event `json:"events"`
+		Events        []*Event `json:"events"`
+		NextPageToken string   `json:"next_page_token,omitempty"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		var request ListEventsRequest
 		if err := readJSON(w, r, &request); err != nil {
+			h.log.Error(err)
 			return
 		}
 
-		h.log.Debug("recv list events request")
+		if request.PageSize <= 0 || request.PageSize > 512 {
+			request.PageSize = 512
+		}
 
-		h.mutex.RLock()
-		defer h.mutex.RUnlock()
+		if request.EndTime.IsZero() {
+			request.EndTime = time.Unix(math.MaxUint32-1, 0)
+		}
 
-		var res *roaring.Bitmap
+		events, nextPageToken := h.bitmapFilter(&request)
+
+		h.writeJSON(w, http.StatusOK, &ListEventsResponse{
+			Events:        events,
+			NextPageToken: nextPageToken,
+		})
+	}
+}
+
+func (h *Handler) bitmapFilter(request *ListEventsRequest) ([]*Event, string) {
+	var res *roaring.Bitmap
+
+	trace(h.log, "filter mark", func() {
 		for _, and := range request.Filter.And {
 			var mid *roaring.Bitmap
 			for _, or := range and.Or {
@@ -187,179 +198,201 @@ func (h *Handler) list() http.HandlerFunc {
 				res.And(mid)
 			}
 		}
+	})
 
-		if !res.IsEmpty() {
-			h.log.Debug("equality filtered", "bitmap", res.String())
+	trace(h.log, "filter range start_time", func() {
+		res = h.startTime.CompareValue(4, bsi.LE, request.EndTime.Unix(), 0, res)
+	})
+
+	trace(h.log, "filter range end_time", func() {
+		res = h.endTime.CompareValue(4, bsi.GE, request.StartTime.Unix(), 0, res)
+	})
+
+	iter := res.Iterator()
+	if len(request.PageToken) > 0 {
+		maxLen := base64.StdEncoding.DecodedLen(len(request.PageToken))
+		buf := make([]byte, maxLen)
+		if _, err := base64.StdEncoding.Decode(buf, []byte(request.PageToken)); err != nil {
+			panic(err)
+		}
+		iter.AdvanceIfNeeded(h.indexes[string(buf)])
+	}
+
+	events := make([]*Event, 0, request.PageSize)
+
+	trace(h.log, "collect result", func() {
+		for iter.HasNext() && len(events) < request.PageSize {
+			index := iter.Next()
+
+			var event Event
+			decodeEvent(h.skl.Get(h.keys[index]).Value, &event)
+
+			events = append(events, &event)
+		}
+	})
+
+	var nextPageToken string
+	if iter.HasNext() {
+		last := events[len(events)-1]
+		nextPageToken = base64.StdEncoding.EncodeToString(encodeKey(last.StartTime, last.ID))
+	}
+
+	return events, nextPageToken
+}
+
+func (h *Handler) recover() error {
+	for i := uint64(1); i <= h.wal.LastIndex(); i++ {
+		entry, err := h.wal.GetEntry(i)
+		if err != nil {
+			return err
 		}
 
-		// start_time <= :end_time
-		startTime := h.startTime.CompareValue(4, bsi.LT, request.EndTime.Unix(), 0, nil)
-		startTime.Or(h.startTime.CompareValue(4, bsi.EQ, request.EndTime.Unix(), 0, nil))
-		if res == nil {
-			res = startTime
-		} else {
-			res.And(startTime)
-		}
+		key := make([]byte, 24)
+		copy(key, entry[0:24])
 
-		if !res.IsEmpty() {
-			h.log.Debug("start_time filtered", "bitmap", res.String())
-		}
+		size := binary.BigEndian.Uint32(entry[24 : 24+4])
+		value := make([]byte, size)
+		copy(value, entry[24+4:])
 
-		// end_time >= :start_time
-		endTime := h.endTime.CompareValue(4, bsi.GT, request.StartTime.Unix(), 0, nil)
-		endTime.Or(h.endTime.CompareValue(4, bsi.EQ, request.StartTime.Unix(), 0, nil))
-		res.And(endTime)
+		h.skl.Put(key, y.ValueStruct{
+			Value:    value,
+			Meta:     0,
+			UserMeta: 0,
+		})
+	}
 
-		if !res.IsEmpty() {
-			h.log.Debug("end_time filtered", "bitmap", res.String())
-		}
+	return nil
+}
 
-		events := []*Event{}
+func (h *Handler) scanFilter(request *ListEventsRequest) []*Event {
+	events := []*Event{}
 
-		err := h.storage.View(func(txn *badger.Txn) error {
-			opts := badger.DefaultIteratorOptions
-			opts.PrefetchSize = 10
-			it := txn.NewIterator(opts)
-			defer it.Close()
+	it := h.skl.NewIterator()
+	defer it.Close()
 
-			if !res.IsEmpty() {
-				minID := res.Minimum()
-				it.Seek(eventKey(minID))
-			} else {
-				it.Rewind()
+	prefix := make([]byte, 24)
+	encodeTime(prefix[0:8], request.EndTime)
+	for i := 8; i < 24; i++ {
+		prefix[i] = 0xff
+	}
+
+	it.Seek(prefix)
+	if !it.Valid() {
+		it.SeekToLast()
+	}
+
+	trace(h.log, "filter", func() {
+	LOOP:
+		for ; it.Valid(); it.Prev() {
+			var event Event
+			decodeEvent(it.Value().Value, &event)
+
+			if event.EndTime.Before(request.StartTime) {
+				continue
 			}
 
-			for ; it.ValidForPrefix([]byte("events_")); it.Next() {
-				item := it.Item()
-				id, err := eventID(item.Key())
-				if err != nil {
-					return err
-				}
-
-				if !res.IsEmpty() {
-					if id > res.Maximum() {
-						return nil
-					} else if !res.Contains(id) {
-						continue
+			for _, and := range request.Filter.And {
+				oneof := false
+				for _, or := range and.Or {
+					if len(or.Tag) > 0 && slices.Contains(event.Tags, or.Tag) {
+						oneof = true
+						break
+					} else if len(or.Annotation.Key) > 0 {
+						v, ok := event.Annotations[or.Annotation.Key]
+						if ok && v == or.Annotation.Value {
+							oneof = true
+							break
+						}
 					}
 				}
-
-				var event *Event
-				err = item.Value(func(v []byte) error {
-					return json.Unmarshal(v, &event)
-				})
-				if err != nil {
-					return err
+				if !oneof {
+					continue LOOP
 				}
-
-				events = append(events, event)
 			}
 
-			return nil
-		})
+			events = append(events, &event)
+		}
+	})
+
+	return events
+}
+
+func (h *Handler) index() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		it := h.skl.NewIterator()
+		defer it.Close()
+
+		index := uint32(0)
+		for it.SeekToLast(); it.Valid(); it.Prev() {
+			var event Event
+			decodeEvent(it.Value().Value, &event)
+
+			key := it.Key()
+			h.keys[index] = key
+			h.indexes[string(key)] = index
+
+			h.startTime.SetValue(uint64(index), event.StartTime.Unix())
+			h.endTime.SetValue(uint64(index), event.EndTime.Unix())
+
+			for _, tag := range event.Tags {
+				if _, ok := h.tags[tag]; !ok {
+					h.tags[tag] = roaring.New()
+				}
+				h.tags[tag].Add(index)
+			}
+
+			for key, value := range event.Annotations {
+				pair := Pair{Key: key, Value: value}
+				if _, ok := h.annotations[pair]; !ok {
+					h.annotations[pair] = roaring.New()
+				}
+				h.annotations[pair].Add(index)
+			}
+
+			index++
+		}
+
+		runtime.GC()
+	}
+}
+
+func (h *Handler) writeJSON(w http.ResponseWriter, statusCode int, data any) {
+	w.WriteHeader(statusCode)
+	if data == nil {
+		return
+	}
+	trace(h.log, "marshal", func() {
+		bytes, err := json.Marshal(data)
 		if err != nil {
-			h.log.Error("storage view fail", "err", err)
-			http.Error(w, "storage view fail", http.StatusInternalServerError)
+			http.Error(w, "failed to encode response", http.StatusInternalServerError)
 			return
 		}
-
-		slices.SortFunc(events, func(a *Event, b *Event) int {
-			if a.StartTime.After(b.StartTime) ||
-				a.StartTime.Equal(b.StartTime) && a.ID > b.ID {
-				return -1
-			}
-			return 1
-		})
-
-		writeJSON(w, http.StatusOK, &ListEventsResponse{
-			Events: events,
-		})
-	}
-}
-
-func (h *Handler) indexEvents() error {
-	h.mutex.Lock()
-	defer h.mutex.Unlock()
-	h.log.Debug("start initial indexing")
-	return h.storage.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchSize = 512
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Rewind(); it.ValidForPrefix([]byte("events_")); it.Next() {
-			var event *Event
-			err := it.Item().Value(func(v []byte) error {
-				return json.Unmarshal(v, &event)
-			})
-			if err != nil {
-				return err
-			}
-			if event.ID%100 == 0 {
-				h.log.Debugf("indexed up to %d", event.ID)
-			}
-			h.indexEvent(event)
-		}
-		h.log.Debug("end initial indexing")
-		return nil
+		w.Write(bytes)
 	})
-}
-
-func (h *Handler) indexEventLock(event *Event) {
-	h.mutex.Lock()
-	defer h.mutex.Unlock()
-	h.indexEvent(event)
-}
-
-func (h *Handler) indexEvent(event *Event) {
-	h.startTime.SetValue(uint64(event.ID), event.StartTime.Unix())
-	h.endTime.SetValue(uint64(event.ID), event.EndTime.Unix())
-
-	for _, tag := range event.Tags {
-		if _, ok := h.tags[tag]; !ok {
-			h.tags[tag] = roaring.New()
-		}
-		h.tags[tag].Add(event.ID)
-	}
-
-	for key, value := range event.Annotations {
-		pair := Pair{Key: key, Value: value}
-		if _, ok := h.annotations[pair]; !ok {
-			h.annotations[pair] = roaring.New()
-		}
-		h.annotations[pair].Add(event.ID)
-	}
-}
-
-func eventKey(id uint32) []byte {
-	return []byte("events_" + strconv.FormatUint(uint64(id), 10))
-}
-
-func eventID(key []byte) (uint32, error) {
-	idString := strings.TrimPrefix(string(key), "events_")
-	id, err := strconv.ParseUint(idString, 10, 32)
-	if err != nil {
-		return 0, err
-	}
-	return uint32(id), nil
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	if err := json.NewDecoder(r.Body).Decode(&dst); err != nil {
 		http.Error(w, "failed to decode request", http.StatusBadRequest)
-		return fmt.Errorf("failed to decode request")
+		return fmt.Errorf("failed to decode request: %w", err)
 	}
 	return nil
 }
 
-func writeJSON(w http.ResponseWriter, statusCode int, data any) {
-	w.WriteHeader(statusCode)
-	if data == nil {
-		return
-	}
-	bytes, err := json.Marshal(data)
-	if err != nil {
-		http.Error(w, "failed to encode response", http.StatusInternalServerError)
-		return
-	}
-	w.Write(bytes)
+func trace(log *zap.SugaredLogger, name string, f func()) {
+	start := time.Now()
+
+	f()
+
+	log.Debugw("trace", "name", name, "elapsed", time.Since(start).String())
+}
+
+func traceErr(log *zap.SugaredLogger, name string, f func() error) error {
+	start := time.Now()
+
+	err := f()
+
+	log.Debugw("trace", "name", name, "elapsed", time.Since(start).String())
+
+	return err
 }

@@ -18,7 +18,7 @@ func main() {
 	logger := zapLogger.Sugar()
 
 	s := &http.Server{
-		Handler: bitstar.NewHandler(logger),
+		Handler: bitstar.NewHandler(logger, "tmp"),
 		Addr:    ":8080",
 	}
 
