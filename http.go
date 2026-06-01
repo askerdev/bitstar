@@ -264,16 +264,25 @@ func (h *Handler) recover() error {
 	return nil
 }
 
-func (h *Handler) scanFilter(request *ListEventsRequest) []*Event {
-	events := []*Event{}
+func (h *Handler) scanFilter(request *ListEventsRequest) ([]*Event, string) {
+	events := make([]*Event, 0, request.PageSize)
 
 	it := h.skl.NewIterator()
 	defer it.Close()
 
 	prefix := make([]byte, 24)
-	encodeTime(prefix[0:8], request.EndTime)
-	for i := 8; i < 24; i++ {
-		prefix[i] = 0xff
+	if len(request.PageToken) > 0 {
+		maxLen := base64.StdEncoding.DecodedLen(len(request.PageToken))
+		buf := make([]byte, maxLen)
+		if _, err := base64.StdEncoding.Decode(buf, []byte(request.PageToken)); err != nil {
+			panic(err)
+		}
+		prefix = buf
+	} else {
+		encodeTime(prefix[0:8], request.EndTime)
+		for i := 8; i < 24; i++ {
+			prefix[i] = 0xff
+		}
 	}
 
 	it.Seek(prefix)
@@ -283,7 +292,7 @@ func (h *Handler) scanFilter(request *ListEventsRequest) []*Event {
 
 	trace(h.log, "filter", func() {
 	LOOP:
-		for ; it.Valid(); it.Prev() {
+		for ; it.Valid() && len(events) <= request.PageSize; it.Prev() {
 			var event Event
 			decodeEvent(it.Value().Value, &event)
 
@@ -314,7 +323,13 @@ func (h *Handler) scanFilter(request *ListEventsRequest) []*Event {
 		}
 	})
 
-	return events
+	var nextPageToken string
+	if it.Valid() {
+		last := events[len(events)-1]
+		nextPageToken = base64.StdEncoding.EncodeToString(encodeKey(last.StartTime, last.ID))
+	}
+
+	return events, nextPageToken
 }
 
 func (h *Handler) index() http.HandlerFunc {
