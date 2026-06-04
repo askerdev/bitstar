@@ -1,28 +1,11 @@
 package bitstar
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"time"
 
 	"github.com/google/uuid"
 )
-
-func encodeEvent(event *Event) []byte {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(event); err != nil {
-		panic(err)
-	}
-	return buf.Bytes()
-}
-
-func decodeEvent(data []byte, event *Event) {
-	buf := bytes.NewBuffer(data)
-	if err := gob.NewDecoder(buf).Decode(event); err != nil {
-		panic(err)
-	}
-}
 
 func encodeKey(startTime time.Time, id uuid.UUID) []byte {
 	buf := make([]byte, 24)

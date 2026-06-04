@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-
-xh --meta POST $api/v1/events:batchCreate @create.json | jq

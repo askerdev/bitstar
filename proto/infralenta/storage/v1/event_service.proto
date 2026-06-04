@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package infralenta.storage.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/askerdev/bitstar/proto/infralenta/storage/v1;storagepb";
+
+service EventService {
+  rpc BatchCreateEvents(BatchCreateEventsRequest) returns (BatchCreateEventsResponse);
+
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+}
+
+message Event {
+  string name = 1;
+
+  string title = 2;
+
+  string description = 3;
+
+  google.protobuf.Timestamp start_time = 4;
+
+  google.protobuf.Timestamp end_time = 5;
+
+  repeated string tags = 6;
+
+  map<string, string> annotations = 7;
+
+  string created_by = 8;
+
+  string updated_by = 9;
+
+  google.protobuf.Timestamp create_time = 10;
+
+  google.protobuf.Timestamp update_time = 11;
+
+  google.protobuf.Timestamp delete_time = 12;
+}
+
+message CreateEventRequest {
+  Event event = 1;
+}
+
+message BatchCreateEventsRequest {
+  repeated CreateEventRequest requests = 1;
+}
+
+message BatchCreateEventsResponse {
+  repeated Event events = 1;
+}
+
+message ListEventsRequest {
+  int32 page_size = 1;
+
+  string page_token = 2;
+
+  google.protobuf.Timestamp start_time = 3;
+
+  google.protobuf.Timestamp end_time = 4;
+
+  string query = 5;
+}
+
+message ListEventsResponse {
+  repeated Event events = 1;
+
+  string next_page_token = 2;
+}

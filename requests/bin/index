@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-
-xh --meta GET $api/v1/index

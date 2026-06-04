@@ -1,21 +1,22 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"math"
-	"net/http"
 	"os"
 	"strconv"
 	"time"
 
+	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
 	"github.com/google/uuid"
 	"go.ytsaurus.tech/yt/go/yson"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type ResourceManagerEntity struct {
@@ -89,6 +90,23 @@ func main() {
 	}
 	defer file.Close()
 
+	const maxMsgSize = 134217728
+
+	conn, err := grpc.NewClient(
+		"localhost:11080",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxMsgSize),
+			grpc.MaxCallSendMsgSize(maxMsgSize),
+		),
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	client := storagepb.NewEventServiceClient(conn)
+
 	rowCount := int64(0)
 	errorCount := int64(0)
 	startTime := time.Now()
@@ -97,7 +115,7 @@ func main() {
 
 	reader := yson.NewReaderKind(file, yson.StreamListFragment)
 
-	batch := []CreateEventRequest{}
+	batch := []*storagepb.CreateEventRequest{}
 	const batchSize = 128 * 1024
 
 	saw := make(map[int32]struct{})
@@ -129,30 +147,28 @@ func main() {
 
 		saw[*event.ID] = struct{}{}
 
-		params := CreateEventRequest{
-			Event: &BitstarEvent{
+		params := &storagepb.CreateEventRequest{
+			Event: &storagepb.Event{
 				Title:       strptr(event.Title),
 				Description: strptr(event.Description),
-				Resource: Resource{
-					TypeCode:   resourceTypeCode(event.ResourceManagerEntity.Type),
-					ExternalID: event.ResourceManagerEntity.Slug,
-				},
-				StartTime: time.Unix(int64(*event.StartTime), 0),
+				StartTime:   timestamppb.New(time.Unix(int64(*event.StartTime), 0)),
 				Annotations: map[string]string{
-					"created_by":        strptr(event.CreatedBy),
-					"updated_by":        strptr(event.UpdatedBy),
-					"service_id":        int32strptr(event.ServiceID),
-					"environment_id":    int32strptr(event.EnvironmentID),
-					"type":              strptr(event.Type),
-					"severity":          strptr(event.Severity),
-					"tickets":           strptr(event.Tickets),
-					"meta":              strptr(event.Meta),
-					"calendar_event_id": int32strptr(event.CalendarEventID),
-					"is_deleted":        boolstrptr(event.IsDeleted),
-					"attendees":         string(convertStringSliceToJSON(event.Attendees)),
-					"infralenta_id":     strptr(event.InfralentaID),
-					"created_at":        microsecondsToTime(event.CreatedAt).String(),
-					"updated_at":        microsecondsToTime(event.UpdatedAt).String(),
+					"resource_type_code":   resourceTypeCode(event.ResourceManagerEntity.Type),
+					"resource_external_id": event.ResourceManagerEntity.Slug,
+					"created_by":           strptr(event.CreatedBy),
+					"updated_by":           strptr(event.UpdatedBy),
+					"service_id":           int32strptr(event.ServiceID),
+					"environment_id":       int32strptr(event.EnvironmentID),
+					"type":                 strptr(event.Type),
+					"severity":             strptr(event.Severity),
+					"tickets":              strptr(event.Tickets),
+					"meta":                 strptr(event.Meta),
+					"calendar_event_id":    int32strptr(event.CalendarEventID),
+					"is_deleted":           boolstrptr(event.IsDeleted),
+					"attendees":            string(convertStringSliceToJSON(event.Attendees)),
+					"infralenta_id":        strptr(event.InfralentaID),
+					"created_at":           microsecondsToTime(event.CreatedAt).String(),
+					"updated_at":           microsecondsToTime(event.UpdatedAt).String(),
 				},
 			},
 		}
@@ -161,7 +177,7 @@ func main() {
 		if event.FinishTime != nil {
 			endTime = time.Unix(int64(*event.FinishTime), 0)
 		}
-		params.Event.EndTime = endTime
+		params.Event.EndTime = timestamppb.New(endTime)
 
 		if len(event.Components) > 0 {
 			params.Event.Tags = append(params.Event.Tags, event.Components...)
@@ -177,14 +193,14 @@ func main() {
 		rowCount++
 
 		if len(batch) >= batchSize {
-			err := batchCreateEvents(context.Background(), &BatchCreateEventRequest{Requests: batch})
+			_, err := client.BatchCreateEvents(context.Background(), &storagepb.BatchCreateEventsRequest{Requests: batch})
 			if err != nil {
 				log.Printf("batch insert error: %v", err)
 				errorCount += int64(len(batch))
 			} else {
 				fmt.Printf("Inserted batch of %d rows. Total: %d\n", len(batch), rowCount)
 			}
-			batch = []CreateEventRequest{}
+			batch = []*storagepb.CreateEventRequest{}
 		}
 
 		if rowCount <= 10 {
@@ -194,7 +210,7 @@ func main() {
 	}
 
 	if len(batch) > 0 {
-		err := batchCreateEvents(context.Background(), &BatchCreateEventRequest{Requests: batch})
+		_, err := client.BatchCreateEvents(context.Background(), &storagepb.BatchCreateEventsRequest{Requests: batch})
 		if err != nil {
 			log.Printf("final batch insert error: %v", err)
 			errorCount += int64(len(batch))
@@ -209,37 +225,6 @@ func main() {
 	fmt.Printf("Errors encountered: %d\n", errorCount)
 	fmt.Printf("Total time: %v\n", elapsed)
 	fmt.Printf("Average rate: %.0f rows/sec\n", float64(rowCount)/elapsed.Seconds())
-}
-
-func batchCreateEvents(ctx context.Context, in *BatchCreateEventRequest) error {
-	body, _ := json.Marshal(in)
-
-	request, err := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		"http://localhost:8080/v1/events:batchCreate",
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		bytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("request failed, body %q", string(bytes))
-	}
-
-	return nil
 }
 
 func resourceTypeCode(resourceType string) string {
