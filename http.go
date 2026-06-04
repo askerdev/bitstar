@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/askerdev/bitstar/bsi"
+	"github.com/askerdev/bitstar/filtering"
 	"github.com/askerdev/bitstar/wal"
 	"github.com/dgraph-io/badger/v4/skl"
 	"github.com/dgraph-io/badger/v4/y"
@@ -26,6 +28,7 @@ type Handler struct {
 	mux *http.ServeMux
 	skl *skl.Skiplist
 
+	all         *roaring.Bitmap
 	startTime   *bsi.BSI
 	endTime     *bsi.BSI
 	tags        map[string]*roaring.Bitmap
@@ -46,6 +49,7 @@ func NewHandler(log *zap.SugaredLogger, walDir string) *Handler {
 		endTime:     bsi.NewDefaultBSI(),
 		tags:        make(map[string]*roaring.Bitmap),
 		annotations: make(map[Pair]*roaring.Bitmap),
+		all:         roaring.New(),
 		keys:        make(map[uint32][]byte),
 		indexes:     make(map[string]uint32),
 		wal:         wal.Must(wal.New(filepath.Join(walDir, "wal"))),
@@ -133,11 +137,12 @@ func (h *Handler) batchCreate() http.HandlerFunc {
 }
 
 type ListEventsRequest struct {
-	StartTime time.Time `json:"start_time"`
-	EndTime   time.Time `json:"end_time"`
-	PageToken string    `json:"page_token"`
-	PageSize  int       `json:"page_size"`
-	Filter    Filter    `json:"filter"`
+	StartTime        time.Time `json:"start_time"`
+	EndTime          time.Time `json:"end_time"`
+	PageToken        string    `json:"page_token"`
+	PageSize         int       `json:"page_size"`
+	Filter           string    `json:"filter"`
+	StructuredFilter Filter    `json:"structured_filter"`
 }
 
 func (h *Handler) list() http.HandlerFunc {
@@ -161,7 +166,12 @@ func (h *Handler) list() http.HandlerFunc {
 			request.EndTime = time.Unix(math.MaxUint32-1, 0)
 		}
 
-		events, nextPageToken := h.bitmapFilter(&request)
+		events, nextPageToken, err := h.bitmapFilter(&request)
+		if err != nil {
+			h.log.Errorw("filter fail", "err", err)
+			http.Error(w, "filter fail", http.StatusInternalServerError)
+			return
+		}
 
 		h.writeJSON(w, http.StatusOK, &ListEventsResponse{
 			Events:        events,
@@ -170,35 +180,20 @@ func (h *Handler) list() http.HandlerFunc {
 	}
 }
 
-func (h *Handler) bitmapFilter(request *ListEventsRequest) ([]*Event, string) {
+func (h *Handler) bitmapFilter(request *ListEventsRequest) ([]*Event, string, error) {
 	var res *roaring.Bitmap
 
-	trace(h.log, "filter mark", func() {
-		for _, and := range request.Filter.And {
-			var mid *roaring.Bitmap
-			for _, or := range and.Or {
-				if rb, ok := h.tags[or.Tag]; ok {
-					if mid == nil {
-						mid = rb.Clone()
-					} else {
-						mid.Or(rb)
-					}
-				}
-				if rb, ok := h.annotations[or.Annotation]; ok {
-					if mid == nil {
-						mid = rb.Clone()
-					} else {
-						mid.Or(rb)
-					}
-				}
-			}
-			if res == nil {
-				res = mid
-			} else if mid != nil {
-				res.And(mid)
-			}
+	err := traceErr(h.log, "filter mark", func() error {
+		filter, err := filtering.ParseFilter(request.Filter)
+		if err != nil {
+			return err
 		}
+		res, err = h.evalFilter(filter)
+		return err
 	})
+	if err != nil {
+		return nil, "", err
+	}
 
 	trace(h.log, "filter range start_time", func() {
 		res = h.startTime.CompareValue(4, bsi.LE, request.EndTime.Unix(), 0, res)
@@ -237,7 +232,135 @@ func (h *Handler) bitmapFilter(request *ListEventsRequest) ([]*Event, string) {
 		nextPageToken = base64.StdEncoding.EncodeToString(encodeKey(last.StartTime, last.ID))
 	}
 
-	return events, nextPageToken
+	return events, nextPageToken, nil
+}
+
+func (h *Handler) evalFilter(filter *filtering.Filter) (*roaring.Bitmap, error) {
+	if filter == nil || filter.Expression == nil {
+		return nil, nil
+	}
+	var res *roaring.Bitmap
+	for _, seq := range filter.Expression.Sequences {
+		bitmap, err := h.evalSequence(seq)
+		if err != nil {
+			return nil, err
+		}
+		if res == nil {
+			res = bitmap
+		} else {
+			res.And(bitmap)
+		}
+	}
+	return res, nil
+}
+
+func (h *Handler) evalSequence(sequence *filtering.Sequence) (*roaring.Bitmap, error) {
+	if sequence == nil {
+		return nil, nil
+	}
+	var res *roaring.Bitmap
+	for _, factor := range sequence.Factors {
+		bitmap, err := h.evalFactor(factor)
+		if err != nil {
+			return nil, err
+		}
+		if res == nil {
+			res = bitmap
+		} else {
+			res.And(bitmap)
+		}
+	}
+	return res, nil
+}
+
+func (h *Handler) evalFactor(factor *filtering.Factor) (*roaring.Bitmap, error) {
+	if factor == nil {
+		return nil, nil
+	}
+	var res *roaring.Bitmap
+	for _, term := range factor.Terms {
+		bitmap, err := h.evalTerm(term)
+		if err != nil {
+			return nil, err
+		}
+		if res == nil {
+			res = bitmap
+		} else {
+			res.Or(bitmap)
+		}
+	}
+	return res, nil
+}
+
+func (h *Handler) evalTerm(term *filtering.Term) (*roaring.Bitmap, error) {
+	if term == nil {
+		return nil, nil
+	}
+	bitmap, err := h.evalSimple(term.Simple)
+	if err != nil {
+		return nil, err
+	}
+	if bitmap == nil {
+		return nil, nil
+	}
+	if term.Negated {
+		allNot := h.all.Clone()
+		allNot.AndNot(bitmap)
+		bitmap = allNot
+	}
+	return bitmap, nil
+}
+
+func (h *Handler) evalSimple(simple *filtering.Simple) (*roaring.Bitmap, error) {
+	if simple == nil {
+		return nil, nil
+	}
+	switch {
+	case simple.Composite != nil:
+		return h.evalFilter(&filtering.Filter{Expression: simple.Composite})
+	case simple.Restriction != nil:
+		return h.evalRestriction(simple.Restriction)
+	}
+	return nil, nil
+}
+
+func (h *Handler) evalRestriction(r *filtering.Restriction) (*roaring.Bitmap, error) {
+	if r.Comparable == nil || r.Comparable.Member == nil || r.Comparable.Member.Value == nil {
+		return nil, errors.New("invalid restriction")
+	}
+
+	var bitmap *roaring.Bitmap
+	fieldName := r.Comparable.Member.Value.Value
+	switch fieldName {
+	case "tags":
+		if r.Arg == nil || r.Arg.Comparable == nil || r.Arg.Comparable.Member == nil || r.Arg.Comparable.Member.Value == nil {
+			return nil, errors.New("`tags` requires argument")
+		}
+		if !r.Arg.Comparable.Member.Value.Quoted {
+			return nil, errors.New("`tags` value type mismatch, expected string, got not quoted value")
+		}
+		tagName := r.Arg.Comparable.Member.Value.Value
+		if rb, ok := h.tags[tagName]; ok {
+			bitmap = rb.Clone()
+		}
+	case "annotations":
+		if len(r.Comparable.Member.Fields) == 0 || r.Arg == nil || r.Arg.Comparable == nil || r.Arg.Comparable.Member == nil || r.Arg.Comparable.Member.Value == nil {
+			return nil, errors.New("`annotations` requires key and value")
+		}
+		if !r.Arg.Comparable.Member.Value.Quoted {
+			return nil, errors.New("`annotations` value type mismatch, expected string, got not quoted value")
+		}
+		key := r.Comparable.Member.Fields[0].Value
+		value := r.Arg.Comparable.Member.Value.Value
+		pair := Pair{Key: key, Value: value}
+		if rb, ok := h.annotations[pair]; ok {
+			bitmap = rb.Clone()
+		}
+	default:
+		return nil, fmt.Errorf("unknown field %q", fieldName)
+	}
+
+	return bitmap, nil
 }
 
 func (h *Handler) recover() error {
@@ -300,7 +423,7 @@ func (h *Handler) scanFilter(request *ListEventsRequest) ([]*Event, string) {
 				continue
 			}
 
-			for _, and := range request.Filter.And {
+			for _, and := range request.StructuredFilter.And {
 				oneof := false
 				for _, or := range and.Or {
 					if len(or.Tag) > 0 && slices.Contains(event.Tags, or.Tag) {
@@ -345,6 +468,8 @@ func (h *Handler) index() http.HandlerFunc {
 			key := it.Key()
 			h.keys[index] = key
 			h.indexes[string(key)] = index
+
+			h.all.Add(index)
 
 			h.startTime.SetValue(uint64(index), event.StartTime.Unix())
 			h.endTime.SetValue(uint64(index), event.EndTime.Unix())

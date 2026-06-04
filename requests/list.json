@@ -1,38 +1,5 @@
 {
-  "start_time": "2026-01-01T00:00:00.000Z",
-  "end_time": "2026-04-01T00:00:00.000Z",
-  "filter": {
-    "and": [
-      {
-        "or": [
-          {
-            "annotation": {
-              "key": "type",
-              "value": "issue"
-            }
-          }
-        ]
-      },
-      {
-        "or": [
-          {
-            "annotation": {
-              "key": "severity",
-              "value": "major"
-            }
-          }
-        ]
-      },
-      {
-        "or": [
-          {
-            "annotation": {
-              "key": "service_id",
-              "value": "65"
-            }
-          }
-        ]
-      }
-    ]
-  }
+  "start_time": "2026-05-04T00:00:00.000Z",
+  "end_time": "2026-05-05T23:59:59.000Z",
+	"filter": "annotations.type = \"maintenance\" AND annotations.severity = \"minor\" AND (annotations.service_id = \"8335\" OR annotations.service_id = \"7224\")"
 }
