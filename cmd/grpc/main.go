@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net"
+	"path/filepath"
 
 	"github.com/askerdev/bitstar"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
@@ -20,7 +21,11 @@ func main() {
 
 	logger := zapLogger.Sugar()
 
-	eventService := bitstar.NewEventService(logger, "tmp")
+	storage, err := bitstar.Open(filepath.Join("tmp", "bbolt.db"))
+	if err != nil {
+		panic(err)
+	}
+	defer storage.Close()
 
 	const maxMsgSize = 134217728
 
@@ -29,7 +34,7 @@ func main() {
 		grpc.MaxSendMsgSize(maxMsgSize),
 	)
 
-	storagepb.RegisterEventServiceServer(server, eventService)
+	storagepb.RegisterEventServiceServer(server, storage)
 	reflection.Register(server)
 
 	lis, err := net.Listen("tcp", ":11080")

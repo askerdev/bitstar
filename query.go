@@ -18,7 +18,7 @@ type Query struct {
 	lastKey []byte
 }
 
-func (q *Query) Exec(ris []*roaringIndex) ([][]byte, error) {
+func (q *Query) Do(ris []*roaringIndex) ([][]byte, error) {
 	filter, err := filtering.ParseFilter(q.Filter)
 	if err != nil {
 		return nil, err
@@ -37,6 +37,10 @@ func (q *Query) Exec(ris []*roaringIndex) ([][]byte, error) {
 
 	hasNext := false
 	for _, ri := range ris {
+		if ri == nil {
+			continue
+		}
+
 		posting, err := ri.query(q.StartTime, q.EndTime, filter)
 		if err != nil {
 			return nil, err

@@ -11,7 +11,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func TestQuery_Exec(t *testing.T) {
+func TestQuery_Do(t *testing.T) {
 	bucketName := []byte("events")
 
 	now := time.Now().Truncate(time.Second)
@@ -115,7 +115,7 @@ func TestQuery_Exec(t *testing.T) {
 
 	for i, tt := range tc {
 		t.Run(fmt.Sprintf("#%d", i), func(t *testing.T) {
-			keys, err := tt.q.Exec(ris)
+			keys, err := tt.q.Do(ris)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -123,7 +123,7 @@ func TestQuery_Exec(t *testing.T) {
 			nextPageToken := tt.q.NextPageToken()
 			for nextPageToken != "" {
 				tt.q.PageToken = nextPageToken
-				nextKeys, err := tt.q.Exec(ris)
+				nextKeys, err := tt.q.Do(ris)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
