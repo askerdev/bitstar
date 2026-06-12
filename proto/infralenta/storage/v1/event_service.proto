@@ -13,7 +13,7 @@ service EventService {
 }
 
 message Event {
-  string name = 1;
+  string id = 1;
 
   string title = 2;
 
@@ -59,7 +59,7 @@ message ListEventsRequest {
 
   google.protobuf.Timestamp end_time = 4;
 
-  string query = 5;
+  string filter = 5;
 }
 
 message ListEventsResponse {

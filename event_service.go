@@ -77,7 +77,7 @@ func (h *EventService) BatchCreateEvents(ctx context.Context, in *storagepb.Batc
 		for _, request := range in.GetRequests() {
 			name := uuid.Must(uuid.NewV7())
 
-			request.Event.Name = name.String()
+			request.Event.Id = name.String()
 
 			key := encodeKey(request.Event.StartTime.AsTime(), name)
 			value, err := proto.Marshal(request.Event)
@@ -148,7 +148,7 @@ func (h *EventService) bitmapFilter(request *storagepb.ListEventsRequest) ([]*st
 	var res *roaring.Bitmap
 
 	err := traceErr(h.log, "filter mark", func() error {
-		filter, err := filtering.ParseFilter(request.Query)
+		filter, err := filtering.ParseFilter(request.GetFilter())
 		if err != nil {
 			return err
 		}
@@ -197,7 +197,7 @@ func (h *EventService) bitmapFilter(request *storagepb.ListEventsRequest) ([]*st
 	var nextPageToken string
 	if iter.HasNext() {
 		last := events[len(events)-1]
-		nextPageToken = base64.StdEncoding.EncodeToString(encodeKey(last.StartTime.AsTime(), uuid.MustParse(last.Name)))
+		nextPageToken = base64.StdEncoding.EncodeToString(encodeKey(last.StartTime.AsTime(), uuid.MustParse(last.GetId())))
 	}
 
 	return events, nextPageToken, nil

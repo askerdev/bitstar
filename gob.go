@@ -19,13 +19,13 @@ func encodeTime(dst []byte, t time.Time) {
 }
 
 func decodeKey(key []byte) (time.Time, uuid.UUID) {
-	nanos := binary.BigEndian.Uint64(key[16:24])
+	nanos := binary.BigEndian.Uint64(key[0:8])
 	startTime := time.Unix(0, int64(nanos))
-	buf := make([]byte, 16)
-	copy(buf, key[0:16])
-	id, err := uuid.FromBytes(buf)
+
+	id, err := uuid.FromBytes(key[8:24])
 	if err != nil {
 		panic(err)
 	}
+
 	return startTime, id
 }
