@@ -148,7 +148,7 @@ func (h *EventService) bitmapFilter(request *storagepb.ListEventsRequest) ([]*st
 	var res *roaring.Bitmap
 
 	err := traceErr(h.log, "filter mark", func() error {
-		filter, err := filtering.ParseFilter(request.Query)
+		filter, err := filtering.ParseFilter(request.Filter)
 		if err != nil {
 			return err
 		}

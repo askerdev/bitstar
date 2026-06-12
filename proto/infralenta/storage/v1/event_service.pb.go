@@ -292,7 +292,7 @@ type ListEventsRequest struct {
 	PageToken     string                 `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	StartTime     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
 	EndTime       *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
-	Query         string                 `protobuf:"bytes,5,opt,name=query,proto3" json:"query,omitempty"`
+	Filter        string                 `protobuf:"bytes,5,opt,name=filter,proto3" json:"filter,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -355,9 +355,9 @@ func (x *ListEventsRequest) GetEndTime() *timestamppb.Timestamp {
 	return nil
 }
 
-func (x *ListEventsRequest) GetQuery() string {
+func (x *ListEventsRequest) GetFilter() string {
 	if x != nil {
-		return x.Query
+		return x.Filter
 	}
 	return ""
 }
@@ -447,15 +447,15 @@ const file_event_service_proto_rawDesc = "" +
 	"\x18BatchCreateEventsRequest\x12E\n" +
 	"\brequests\x18\x01 \x03(\v2).infralenta.storage.v1.CreateEventRequestR\brequests\"Q\n" +
 	"\x19BatchCreateEventsResponse\x124\n" +
-	"\x06events\x18\x01 \x03(\v2\x1c.infralenta.storage.v1.EventR\x06events\"\xd7\x01\n" +
+	"\x06events\x18\x01 \x03(\v2\x1c.infralenta.storage.v1.EventR\x06events\"\xd9\x01\n" +
 	"\x11ListEventsRequest\x12\x1b\n" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x02 \x01(\tR\tpageToken\x129\n" +
 	"\n" +
 	"start_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tstartTime\x125\n" +
-	"\bend_time\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\aendTime\x12\x14\n" +
-	"\x05query\x18\x05 \x01(\tR\x05query\"r\n" +
+	"\bend_time\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\aendTime\x12\x16\n" +
+	"\x06filter\x18\x05 \x01(\tR\x06filter\"r\n" +
 	"\x12ListEventsResponse\x124\n" +
 	"\x06events\x18\x01 \x03(\v2\x1c.infralenta.storage.v1.EventR\x06events\x12&\n" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken2\xe9\x01\n" +
