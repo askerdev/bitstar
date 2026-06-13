@@ -5,9 +5,10 @@ import (
 
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
+	"github.com/bits-and-blooms/bloom/v3"
 )
 
-func TestMatchEvent(t *testing.T) {
+func TestMatchMemTableItem(t *testing.T) {
 	event := &storagepb.Event{
 		Id:    "event-1",
 		Title: "Deploy Service",
@@ -17,6 +18,19 @@ func TestMatchEvent(t *testing.T) {
 			"team":   "infra",
 			"region": "eu-west",
 		},
+	}
+
+	item := &memTableItem{
+		event:       event,
+		tags:        bloom.NewWithEstimates(50, 0.01),
+		annotations: bloom.NewWithEstimates(50, 0.01),
+	}
+
+	for _, tag := range event.Tags {
+		item.tags.AddString(tag)
+	}
+	for k, v := range event.Annotations {
+		item.annotations.AddString(k + "_" + v)
 	}
 
 	tests := []struct {
@@ -127,13 +141,13 @@ func TestMatchEvent(t *testing.T) {
 				}
 			}
 
-			got, err := matchEvent(parsedFilter, event)
+			got, err := matchMemTableItem(parsedFilter, item)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("MatchEvent() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("MatchEventWithBloom() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if got != tt.want {
-				t.Errorf("MatchEvent() got = %v, want %v for filter: %s", got, tt.want, tt.filter)
+				t.Errorf("MatchEventWithBloom() got = %v, want %v for filter: %s", got, tt.want, tt.filter)
 			}
 		})
 	}

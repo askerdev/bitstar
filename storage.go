@@ -9,8 +9,6 @@ import (
 
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"github.com/dgraph-io/badger/v4/skl"
-	"github.com/dgraph-io/badger/v4/y"
 	"github.com/google/uuid"
 	"go.etcd.io/bbolt"
 	"golang.org/x/sync/errgroup"
@@ -20,12 +18,11 @@ import (
 )
 
 const (
-	arenaSize = int64(256 << 20)
+	maxMemTableSize = 64_000
 )
 
 var (
 	eventsBucket = []byte("events")
-	threshold    = int64(arenaSize * 90 / 100)
 
 	levelLimit = map[int]uint32{
 		0: 256_000,
@@ -45,17 +42,16 @@ type writeResponse struct {
 }
 
 type Storage struct {
-	cur           atomic.Pointer[MemTable]
-	pen           atomic.Pointer[[]*MemTable]
-	compactCh     chan *MemTable
-	compactDoneCh chan *MemTable
+	cur           atomic.Pointer[memTable]
+	pen           atomic.Pointer[[]*memTable]
+	compactCh     chan *memTable
+	compactDoneCh chan *memTable
 	levels        atomic.Pointer[[4]*roaringIndex]
 
 	db      *bbolt.DB
 	writeCh chan writeRequest
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
-	doneCh  chan struct{}
 }
 
 func Open(path string) (*Storage, error) {
@@ -82,14 +78,13 @@ func Open(path string) (*Storage, error) {
 	s := &Storage{
 		db:            db,
 		writeCh:       make(chan writeRequest),
-		stopCh:        make(chan struct{}, 1),
-		doneCh:        make(chan struct{}, 1),
-		compactCh:     make(chan *MemTable, 8),
-		compactDoneCh: make(chan *MemTable, 8),
+		stopCh:        make(chan struct{}, 2),
+		compactCh:     make(chan *memTable, 8),
+		compactDoneCh: make(chan *memTable, 8),
 	}
 
-	s.cur.Store(&MemTable{skl: skl.NewSkiplist(arenaSize)})
-	s.pen.Store(&[]*MemTable{})
+	s.cur.Store(newMemTable())
+	s.pen.Store(&[]*memTable{})
 
 	s.levels.Store(&[4]*roaringIndex{nil, nil, nil, ri})
 
@@ -104,8 +99,7 @@ func Open(path string) (*Storage, error) {
 }
 
 func (s *Storage) Close() error {
-	s.stopCh <- struct{}{}
-	s.stopCh <- struct{}{}
+	close(s.stopCh)
 	s.wg.Wait()
 	return s.db.Close()
 }
@@ -130,7 +124,7 @@ func (s *Storage) writeWorker() {
 				}
 			}
 			if idx != -1 {
-				newSlice := make([]*MemTable, 0, len(oldSlice)-1)
+				newSlice := make([]*memTable, 0, len(oldSlice)-1)
 				newSlice = append(newSlice, oldSlice[:idx]...)
 				newSlice = append(newSlice, oldSlice[idx+1:]...)
 
@@ -161,7 +155,7 @@ func (s *Storage) flushWorker(cron time.Duration) {
 	}
 }
 
-func (s *Storage) compact(table *MemTable) error {
+func (s *Storage) compact(table *memTable) error {
 	table.wg.Wait()
 
 	levelsPtr := s.levels.Load()
@@ -172,7 +166,7 @@ func (s *Storage) compact(table *MemTable) error {
 		levelsPtr[3],
 	}
 
-	ri, err := fromSkipList(table.skl)
+	ri, err := fromMemTable(table)
 	if err != nil {
 		return err
 	}
@@ -223,7 +217,6 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 
 func (s *Storage) batchCreateEvents(in *storagepb.BatchCreateEventsRequest) ([]*storagepb.Event, error) {
 	events := make([]*storagepb.Event, 0, len(in.GetRequests()))
-	pairs := make([]BytePair, 0, len(in.GetRequests()))
 
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(eventsBucket)
@@ -244,8 +237,6 @@ func (s *Storage) batchCreateEvents(in *storagepb.BatchCreateEventsRequest) ([]*
 			}
 
 			events = append(events, request.Event)
-
-			pairs = append(pairs, BytePair{Key: key, Val: val})
 		}
 
 		return nil
@@ -254,19 +245,13 @@ func (s *Storage) batchCreateEvents(in *storagepb.BatchCreateEventsRequest) ([]*
 		return nil, status.Errorf(codes.Internal, "batch create fail: %v", err)
 	}
 
-	var batchAllocSize int64
-	for _, pair := range pairs {
-		// 256 is just a magic number to be sure
-		batchAllocSize += int64(len(pair.Key) + len(pair.Val) + 256)
-	}
-
 	curTable := s.cur.Load()
 	curTable.wg.Add(1)
 
-	if curTable.skl.MemSize()+batchAllocSize >= threshold {
+	if curTable.size() >= maxMemTableSize {
 		curTable.wg.Done()
 
-		newTable := &MemTable{skl: skl.NewSkiplist(arenaSize)}
+		newTable := newMemTable()
 		s.cur.Store(newTable)
 
 		select {
@@ -275,20 +260,21 @@ func (s *Storage) batchCreateEvents(in *storagepb.BatchCreateEventsRequest) ([]*
 		}
 
 		oldSlice := *s.pen.Load()
-		newSlice := make([]*MemTable, len(oldSlice)+1)
+		newSlice := make([]*memTable, len(oldSlice)+1)
 		copy(newSlice, oldSlice)
 		newSlice[len(oldSlice)] = curTable
-
 		s.pen.Store(&newSlice)
 
 		curTable = newTable
-
 		curTable.wg.Add(1)
 	}
 
-	for _, pair := range pairs {
-		curTable.skl.Put(pair.Key, y.ValueStruct{Value: pair.Val})
+	curTable.mu.Lock()
+	for _, event := range events {
+		curTable.put(event)
 	}
+	curTable.mu.Unlock()
+
 	curTable.wg.Done()
 
 	return events, nil
@@ -310,7 +296,7 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 	var hasScanNext bool
 
 	eg.Go(func() error {
-		sq := ScanQuery{
+		sq := MemTableQuery{
 			PageToken: in.GetPageToken(),
 			PageSize:  int(in.GetPageSize()),
 			StartTime: in.GetStartTime().AsTime(),
@@ -318,13 +304,13 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 			Filter:    filter,
 		}
 
-		skls := make([]*skl.Skiplist, 0, 1+len(*snapshotPen))
-		skls = append(skls, snapshotCur.skl)
+		mts := make([]*memTable, 0, 1+len(*snapshotPen))
+		mts = append(mts, snapshotCur)
 		for _, mt := range *snapshotPen {
-			skls = append(skls, mt.skl)
+			mts = append(mts, mt)
 		}
 
-		keys, hasNext, err := sq.Do(skls)
+		keys, hasNext, err := sq.Do(mts)
 		if err != nil {
 			return err
 		}

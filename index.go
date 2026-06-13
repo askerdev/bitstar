@@ -11,7 +11,7 @@ import (
 	"github.com/askerdev/bitstar/bsi"
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"github.com/dgraph-io/badger/v4/skl"
+	"github.com/google/uuid"
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 )
@@ -25,6 +25,17 @@ type roaringIndex struct {
 
 	keys    [][]byte
 	indexes map[string]uint32
+}
+
+func newRoaringIndex() *roaringIndex {
+	return &roaringIndex{
+		all:         roaring.New(),
+		startTime:   bsi.NewDefaultBSI(),
+		endTime:     bsi.NewDefaultBSI(),
+		tags:        make(map[string]*roaring.Bitmap),
+		annotations: make(map[Pair]*roaring.Bitmap),
+		indexes:     make(map[string]uint32),
+	}
 }
 
 func (ri *roaringIndex) nextMax(key []byte) (uint32, bool) {
@@ -187,14 +198,7 @@ func (ri *roaringIndex) evalRestriction(r *filtering.Restriction) (*roaring.Bitm
 }
 
 func fromBbolt(db *bbolt.DB, bucket []byte) (*roaringIndex, error) {
-	ri := &roaringIndex{
-		all:         roaring.New(),
-		startTime:   bsi.NewDefaultBSI(),
-		endTime:     bsi.NewDefaultBSI(),
-		tags:        make(map[string]*roaring.Bitmap),
-		annotations: make(map[Pair]*roaring.Bitmap),
-		indexes:     make(map[string]uint32),
-	}
+	ri := newRoaringIndex()
 
 	err := db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucket)
@@ -207,28 +211,7 @@ func fromBbolt(db *bbolt.DB, bucket []byte) (*roaringIndex, error) {
 				return err
 			}
 
-			ri.keys = append(ri.keys, k)
-			index := uint32(len(ri.keys) - 1)
-			ri.all.Add(index)
-			ri.indexes[string(k)] = index
-
-			ri.startTime.SetValue(uint64(index), event.StartTime.AsTime().Unix())
-			ri.endTime.SetValue(uint64(index), event.EndTime.AsTime().Unix())
-
-			for _, tag := range event.Tags {
-				if _, ok := ri.tags[tag]; !ok {
-					ri.tags[tag] = roaring.New()
-				}
-				ri.tags[tag].Add(index)
-			}
-
-			for key, value := range event.Annotations {
-				pair := Pair{Key: key, Value: value}
-				if _, ok := ri.annotations[pair]; !ok {
-					ri.annotations[pair] = roaring.New()
-				}
-				ri.annotations[pair].Add(index)
-			}
+			indexEvent(ri, k, event)
 		}
 
 		return nil
@@ -240,49 +223,33 @@ func fromBbolt(db *bbolt.DB, bucket []byte) (*roaringIndex, error) {
 	return ri, nil
 }
 
-func fromSkipList(skl *skl.Skiplist) (*roaringIndex, error) {
-	ri := &roaringIndex{
-		all:         roaring.New(),
-		startTime:   bsi.NewDefaultBSI(),
-		endTime:     bsi.NewDefaultBSI(),
-		tags:        make(map[string]*roaring.Bitmap),
-		annotations: make(map[Pair]*roaring.Bitmap),
-		indexes:     make(map[string]uint32),
-	}
+func fromMemTable(mt *memTable) (*roaringIndex, error) {
+	ri := newRoaringIndex()
 
-	it := skl.NewIterator()
-	defer it.Close()
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
 
-	for it.SeekToLast(); it.Valid(); it.Prev() {
-		event := &storagepb.Event{}
-		if err := proto.Unmarshal(it.Value().Value, event); err != nil {
-			return nil, err
+	slices.SortFunc(mt.items, func(a, b *memTableItem) int {
+		timeA := a.event.StartTime.AsTime()
+		timeB := b.event.StartTime.AsTime()
+		if timeA.After(timeB) {
+			return -1
 		}
-
-		k := it.Key()
-
-		ri.keys = append(ri.keys, k)
-		index := uint32(len(ri.keys) - 1)
-		ri.all.Add(index)
-		ri.indexes[string(k)] = index
-
-		ri.startTime.SetValue(uint64(index), event.StartTime.AsTime().Unix())
-		ri.endTime.SetValue(uint64(index), event.EndTime.AsTime().Unix())
-
-		for _, tag := range event.Tags {
-			if _, ok := ri.tags[tag]; !ok {
-				ri.tags[tag] = roaring.New()
-			}
-			ri.tags[tag].Add(index)
+		if timeA.Before(timeB) {
+			return 1
 		}
-
-		for key, value := range event.Annotations {
-			pair := Pair{Key: key, Value: value}
-			if _, ok := ri.annotations[pair]; !ok {
-				ri.annotations[pair] = roaring.New()
-			}
-			ri.annotations[pair].Add(index)
+		if b.event.Id > a.event.Id {
+			return 1
 		}
+		if b.event.Id < a.event.Id {
+			return -1
+		}
+		return 0
+	})
+
+	for _, item := range mt.items {
+		k := encodeKey(item.event.StartTime.AsTime(), uuid.MustParse(item.event.Id))
+		indexEvent(ri, k, item.event)
 	}
 
 	return ri, nil
@@ -450,4 +417,29 @@ func mergeBSI(srcA, srcB *bsi.BSI, remapA, remapB []uint32, maxLen uint64) *bsi.
 	}
 
 	return dst
+}
+
+func indexEvent(ri *roaringIndex, key []byte, event *storagepb.Event) {
+	ri.keys = append(ri.keys, key)
+	index := uint32(len(ri.keys) - 1)
+	ri.all.Add(index)
+	ri.indexes[string(key)] = index
+
+	ri.startTime.SetValue(uint64(index), event.StartTime.AsTime().Unix())
+	ri.endTime.SetValue(uint64(index), event.EndTime.AsTime().Unix())
+
+	for _, tag := range event.Tags {
+		if _, ok := ri.tags[tag]; !ok {
+			ri.tags[tag] = roaring.New()
+		}
+		ri.tags[tag].Add(index)
+	}
+
+	for key, value := range event.Annotations {
+		pair := Pair{Key: key, Value: value}
+		if _, ok := ri.annotations[pair]; !ok {
+			ri.annotations[pair] = roaring.New()
+		}
+		ri.annotations[pair].Add(index)
+	}
 }

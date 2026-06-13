@@ -7,15 +7,12 @@ import (
 	"time"
 
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"github.com/dgraph-io/badger/v4/skl"
-	"github.com/dgraph-io/badger/v4/y"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func TestScanQuery_Do(t *testing.T) {
+func TestMemTableQuery_Do(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	uuidMax := "ffffffff-ffff-ffff-ffff-ffffffffffff"
 	uuidMin := "00000000-0000-0000-0000-000000000000"
@@ -71,32 +68,21 @@ func TestScanQuery_Do(t *testing.T) {
 		},
 	}
 
-	skls := make([]*skl.Skiplist, 0, len(events))
+	mts := make([]*memTable, 0, len(events))
 	for _, events := range events {
-		l := skl.NewSkiplist(256 << 20)
+		mt := newMemTable()
 		for _, event := range events {
-			key := encodeKey(event.GetStartTime().AsTime(), uuid.MustParse(event.GetId()))
-
-			val, err := proto.Marshal(event)
-			if err != nil {
-				t.Fatalf("proto marshal fail: %v", err)
-			}
-
-			l.Put(key, y.ValueStruct{
-				Value:    val,
-				Meta:     0,
-				UserMeta: 0,
-			})
+			mt.put(event)
 		}
-		skls = append(skls, l)
+		mts = append(mts, mt)
 	}
 
 	tc := []struct {
-		q    *ScanQuery
+		q    *MemTableQuery
 		want []*storagepb.Event
 	}{
 		{
-			q: &ScanQuery{
+			q: &MemTableQuery{
 				StartTime: now,
 				EndTime:   now,
 				PageSize:  2,
@@ -109,7 +95,7 @@ func TestScanQuery_Do(t *testing.T) {
 			},
 		},
 		{
-			q: &ScanQuery{
+			q: &MemTableQuery{
 				StartTime: now,
 				EndTime:   now,
 				PageSize:  2,
@@ -127,20 +113,19 @@ func TestScanQuery_Do(t *testing.T) {
 
 	for i, tt := range tc {
 		t.Run(fmt.Sprintf("#%d", i), func(t *testing.T) {
-			keys, hasNext, err := tt.q.Do(skls)
+			keys, hasNext, err := tt.q.Do(mts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			next := hasNext
-			for next {
+			for hasNext {
 				tt.q.PageToken = base64.StdEncoding.EncodeToString(keys[len(keys)-1])
-				nextKeys, hasNext, err := tt.q.Do(skls)
+				nextKeys, localHasNext, err := tt.q.Do(mts)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
 				keys = append(keys, nextKeys...)
-				next = hasNext
+				hasNext = localHasNext
 			}
 
 			gotKeysPretty := make([]string, 0, len(keys))
