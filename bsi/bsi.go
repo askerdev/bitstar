@@ -887,3 +887,14 @@ func (b *BSI) Increment(foundSet *roaring.Bitmap) {
 func (b *BSI) IncrementAll() {
 	b.Increment(b.GetExistenceBitmap())
 }
+
+func (b *BSI) GetBitmaps() []*roaring.Bitmap {
+	return b.bA
+}
+
+func (b *BSI) InitBitmaps(bitCount int) {
+	b.bA = make([]*roaring.Bitmap, bitCount)
+	for i := 0; i < bitCount; i++ {
+		b.bA[i] = roaring.NewBitmap()
+	}
+}

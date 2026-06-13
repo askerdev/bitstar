@@ -1,6 +1,7 @@
 package bitstar
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -235,4 +236,85 @@ func db(t testing.TB, bucketName []byte, events []*storagepb.Event) *bbolt.DB {
 		t.Fatalf("bbolt batch fail: %v", err)
 	}
 	return db
+}
+
+func TestMergeTwoIndices(t *testing.T) {
+	bucketName := []byte("events")
+	now := time.Now().Truncate(time.Second)
+
+	events0 := []*storagepb.Event{
+		{
+			Id:          uuid.Must(uuid.NewV7()).String(),
+			StartTime:   timestamppb.New(now.Add(time.Minute * 10)),
+			EndTime:     timestamppb.New(now.Add(time.Hour)),
+			Tags:        []string{"go", "fast"},
+			Annotations: map[string]string{"tier": "0"},
+		},
+		{
+			Id:          uuid.Must(uuid.NewV7()).String(),
+			StartTime:   timestamppb.New(now.Add(time.Minute * 5)),
+			EndTime:     timestamppb.New(now.Add(time.Hour)),
+			Tags:        []string{"backend"},
+			Annotations: map[string]string{"tier": "0"},
+		},
+	}
+
+	events1 := []*storagepb.Event{
+		{
+			Id:          uuid.Must(uuid.NewV7()).String(),
+			StartTime:   timestamppb.New(now.Add(-time.Hour)),
+			EndTime:     timestamppb.New(now),
+			Tags:        []string{"go"},
+			Annotations: map[string]string{"tier": "1"},
+		},
+	}
+
+	db0 := db(t, bucketName, events0)
+	ri0, err := fromBbolt(db0, bucketName)
+	if err != nil {
+		t.Fatalf("failed to create ri0: %v", err)
+	}
+
+	db1 := db(t, bucketName, events1)
+	ri1, err := fromBbolt(db1, bucketName)
+	if err != nil {
+		t.Fatalf("failed to create ri1: %v", err)
+	}
+
+	merged := mergeTwoIndices(ri0, ri1)
+
+	if merged.all.GetCardinality() != 3 {
+		t.Errorf("expected 3 elements in total, got %d", merged.all.GetCardinality())
+	}
+
+	for i := 0; i < len(merged.keys)-1; i++ {
+		if bytes.Compare(merged.keys[i], merged.keys[i+1]) <= 0 {
+			t.Errorf("sort order violation at index %d: key %x is not greater than %x", i, merged.keys[i], merged.keys[i+1])
+		}
+	}
+
+	if !merged.tags["fast"].Contains(0) || merged.tags["fast"].Contains(1) || merged.tags["fast"].Contains(2) {
+		t.Errorf("invalid mapping for tag 'fast', bitmap: %s", merged.tags["fast"])
+	}
+
+	if !merged.tags["go"].Contains(0) || !merged.tags["go"].Contains(2) || merged.tags["go"].Contains(1) {
+		t.Errorf("invalid mapping for tag 'go', bitmap: %s", merged.tags["go"])
+	}
+
+	tier1 := Pair{Key: "tier", Value: "1"}
+	if !merged.annotations[tier1].Contains(2) || merged.annotations[tier1].Contains(0) {
+		t.Errorf("invalid mapping for annotation tier=1, bitmap: %s", merged.annotations[tier1])
+	}
+
+	wantOldUnix := events1[0].StartTime.AsTime().Unix()
+	gotOldUnix, ok := merged.startTime.GetValue(2)
+	if !ok || gotOldUnix != wantOldUnix {
+		t.Errorf("BSI value mismatch for rid=2: want %d, got %d (ok: %t)", wantOldUnix, gotOldUnix, ok)
+	}
+
+	wantNewUnix := events0[0].StartTime.AsTime().Unix()
+	gotNewUnix, ok := merged.startTime.GetValue(0)
+	if !ok || gotNewUnix != wantNewUnix {
+		t.Errorf("BSI value mismatch for rid=0: want %d, got %d (ok: %t)", wantNewUnix, gotNewUnix, ok)
+	}
 }

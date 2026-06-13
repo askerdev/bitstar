@@ -288,7 +288,15 @@ func fromSkipList(skl *skl.Skiplist) (*roaringIndex, error) {
 	return ri, nil
 }
 
-func fromBboltKeys(db *bbolt.DB, bucket []byte, keys [][]byte) (*roaringIndex, error) {
+func mergeTwoIndices(a, b *roaringIndex) *roaringIndex {
+	if a == nil {
+		return b
+	}
+
+	if b == nil {
+		return a
+	}
+
 	ri := &roaringIndex{
 		all:         roaring.New(),
 		startTime:   bsi.NewDefaultBSI(),
@@ -296,48 +304,150 @@ func fromBboltKeys(db *bbolt.DB, bucket []byte, keys [][]byte) (*roaringIndex, e
 		tags:        make(map[string]*roaring.Bitmap),
 		annotations: make(map[Pair]*roaring.Bitmap),
 		indexes:     make(map[string]uint32),
+		keys:        make([][]byte, 0, len(a.keys)+len(b.keys)),
 	}
 
-	err := db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(bucket)
+	remapA := make([]uint32, len(a.keys))
+	remapB := make([]uint32, len(b.keys))
 
-		for _, k := range keys {
-			v := bucket.Get(k)
-
-			event := &storagepb.Event{}
-			if err := proto.Unmarshal(v, event); err != nil {
-				return err
-			}
-
-			ri.keys = append(ri.keys, k)
-			index := uint32(len(ri.keys) - 1)
-			ri.all.Add(index)
-			ri.indexes[string(k)] = index
-
-			ri.startTime.SetValue(uint64(index), event.StartTime.AsTime().Unix())
-			ri.endTime.SetValue(uint64(index), event.EndTime.AsTime().Unix())
-
-			for _, tag := range event.Tags {
-				if _, ok := ri.tags[tag]; !ok {
-					ri.tags[tag] = roaring.New()
-				}
-				ri.tags[tag].Add(index)
-			}
-
-			for key, value := range event.Annotations {
-				pair := Pair{Key: key, Value: value}
-				if _, ok := ri.annotations[pair]; !ok {
-					ri.annotations[pair] = roaring.New()
-				}
-				ri.annotations[pair].Add(index)
-			}
+	i, j := 0, 0
+	for i < len(a.keys) && j < len(b.keys) {
+		compare := bytes.Compare(a.keys[i], b.keys[j])
+		if compare >= 0 {
+			ri.keys = append(ri.keys, a.keys[i])
+			newRID := uint32(len(ri.keys) - 1)
+			remapA[i] = newRID
+			i++
+		} else {
+			ri.keys = append(ri.keys, b.keys[j])
+			newRID := uint32(len(ri.keys) - 1)
+			remapB[j] = newRID
+			j++
 		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 
-	return ri, nil
+	for i < len(a.keys) {
+		ri.keys = append(ri.keys, a.keys[i])
+		newRID := uint32(len(ri.keys) - 1)
+		remapA[i] = newRID
+		i++
+	}
+
+	for j < len(b.keys) {
+		ri.keys = append(ri.keys, b.keys[j])
+		newRID := uint32(len(ri.keys) - 1)
+		remapB[j] = newRID
+		j++
+	}
+
+	if len(ri.keys) > 0 {
+		ri.all.AddRange(0, uint64(len(ri.keys)))
+	}
+
+	for strKey, oldRID := range a.indexes {
+		ri.indexes[strKey] = remapA[oldRID]
+	}
+
+	for strKey, oldRID := range b.indexes {
+		ri.indexes[strKey] = remapB[oldRID]
+	}
+
+	for tag, rb := range a.tags {
+		if _, ok := ri.tags[tag]; !ok {
+			ri.tags[tag] = roaring.New()
+		}
+		moveBitmap(rb, remapA, ri.tags[tag])
+	}
+
+	for tag, rb := range b.tags {
+		if _, ok := ri.tags[tag]; !ok {
+			ri.tags[tag] = roaring.New()
+		}
+		moveBitmap(rb, remapB, ri.tags[tag])
+	}
+
+	for annotation, rb := range a.annotations {
+		if _, ok := ri.annotations[annotation]; !ok {
+			ri.annotations[annotation] = roaring.New()
+		}
+		moveBitmap(rb, remapA, ri.annotations[annotation])
+	}
+
+	for annotation, rb := range b.annotations {
+		if _, ok := ri.annotations[annotation]; !ok {
+			ri.annotations[annotation] = roaring.New()
+		}
+		moveBitmap(rb, remapB, ri.annotations[annotation])
+	}
+
+	totalKeys := uint64(len(ri.keys))
+	ri.startTime = mergeBSI(a.startTime, b.startTime, remapA, remapB, totalKeys)
+	ri.endTime = mergeBSI(a.endTime, b.endTime, remapA, remapB, totalKeys)
+
+	return ri
+}
+
+func moveBitmap(src *roaring.Bitmap, remap []uint32, dst *roaring.Bitmap) {
+	card := src.GetCardinality()
+	if card == 0 {
+		return
+	}
+
+	if card < 32 {
+		it := src.Iterator()
+		for it.HasNext() {
+			dst.Add(remap[it.Next()])
+		}
+		return
+	}
+
+	buf := make([]uint32, card)
+
+	it := src.ManyIterator()
+	it.NextMany(buf)
+
+	for i := range buf {
+		buf[i] = remap[buf[i]]
+	}
+
+	slices.Sort(buf)
+
+	dst.AddMany(buf)
+}
+
+func mergeBSI(srcA, srcB *bsi.BSI, remapA, remapB []uint32, maxLen uint64) *bsi.BSI {
+	maxBitCount := srcA.BitCount()
+	if srcB.BitCount() > maxBitCount {
+		maxBitCount = srcB.BitCount()
+	}
+
+	maxVal := max(srcB.MaxValue, srcA.MaxValue)
+	minVal := min(srcB.MinValue, srcA.MinValue)
+
+	dst := bsi.NewBSI(maxVal, minVal)
+
+	dst.InitBitmaps(maxBitCount)
+
+	dstBitmaps := dst.GetBitmaps()
+
+	srcABitmaps := srcA.GetBitmaps()
+	srcBBitmaps := srcB.GetBitmaps()
+
+	for bitIdx, rb := range srcABitmaps {
+		if bitIdx < len(dstBitmaps) {
+			moveBitmap(rb, remapA, dstBitmaps[bitIdx])
+		}
+	}
+
+	for bitIdx, rb := range srcBBitmaps {
+		if bitIdx < len(dstBitmaps) {
+			moveBitmap(rb, remapB, dstBitmaps[bitIdx])
+		}
+	}
+
+	if maxLen > 0 {
+		dst.GetExistenceBitmap().AddRange(0, maxLen)
+	}
+
+	return dst
 }

@@ -79,7 +79,7 @@ func Open(path string) (*Storage, error) {
 
 	s.levels.Store(&[4]*roaringIndex{nil, nil, nil, ri})
 
-	go s.flushWorker(5 * time.Minute)
+	go s.flushWorker(30 * time.Second)
 
 	return s, nil
 }
@@ -123,33 +123,15 @@ func (s *Storage) compact(table *MemTable) error {
 		levelsPtr[3],
 	}
 
+	ri, err := fromSkipList(table.skl)
+	if err != nil {
+		return err
+	}
+
 	if levels[0] == nil {
-		ri, err := fromSkipList(table.skl)
-		if err != nil {
-			return err
-		}
 		levels[0] = ri
 	} else {
-		keys := [][]byte{}
-		it := table.skl.NewIterator()
-		it.SeekToLast()
-		for ; it.Valid(); it.Prev() {
-			k := append([]byte(nil), it.Key()...)
-			keys = append(keys, k)
-		}
-		it.Close()
-
-		if len(keys) == 0 {
-			s.removeFromPending(table)
-			return nil
-		}
-
-		ri, err := fromBboltKeys(s.db, eventsBucket, mergeKeys(levels[0].keys, keys))
-		if err != nil {
-			return err
-		}
-
-		levels[0] = ri
+		levels[0] = mergeTwoIndices(levels[0], ri)
 	}
 
 	for i := range 3 {
@@ -158,18 +140,8 @@ func (s *Storage) compact(table *MemTable) error {
 		}
 
 		if limit, ok := levelLimit[i]; ok && levels[i].all.GetCardinality() >= uint64(limit) {
-			var nextLevelKeys [][]byte
-			if levels[i+1] != nil {
-				nextLevelKeys = levels[i+1].keys
-			}
-
-			keys := mergeKeys(levels[i].keys, nextLevelKeys)
-			ri, err := fromBboltKeys(s.db, eventsBucket, keys)
-			if err != nil {
-				return err
-			}
+			levels[i+1] = mergeTwoIndices(levels[i], levels[i+1])
 			levels[i] = nil
-			levels[i+1] = ri
 		}
 	}
 
