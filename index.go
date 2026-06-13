@@ -11,6 +11,7 @@ import (
 	"github.com/askerdev/bitstar/bsi"
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
+	"github.com/dgraph-io/badger/v4/skl"
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 )
@@ -201,6 +202,108 @@ func fromBbolt(db *bbolt.DB, bucket []byte) (*roaringIndex, error) {
 		c := bucket.Cursor()
 
 		for k, v := c.Last(); k != nil; k, v = c.Prev() {
+			event := &storagepb.Event{}
+			if err := proto.Unmarshal(v, event); err != nil {
+				return err
+			}
+
+			ri.keys = append(ri.keys, k)
+			index := uint32(len(ri.keys) - 1)
+			ri.all.Add(index)
+			ri.indexes[string(k)] = index
+
+			ri.startTime.SetValue(uint64(index), event.StartTime.AsTime().Unix())
+			ri.endTime.SetValue(uint64(index), event.EndTime.AsTime().Unix())
+
+			for _, tag := range event.Tags {
+				if _, ok := ri.tags[tag]; !ok {
+					ri.tags[tag] = roaring.New()
+				}
+				ri.tags[tag].Add(index)
+			}
+
+			for key, value := range event.Annotations {
+				pair := Pair{Key: key, Value: value}
+				if _, ok := ri.annotations[pair]; !ok {
+					ri.annotations[pair] = roaring.New()
+				}
+				ri.annotations[pair].Add(index)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return ri, nil
+}
+
+func fromSkipList(skl *skl.Skiplist) (*roaringIndex, error) {
+	ri := &roaringIndex{
+		all:         roaring.New(),
+		startTime:   bsi.NewDefaultBSI(),
+		endTime:     bsi.NewDefaultBSI(),
+		tags:        make(map[string]*roaring.Bitmap),
+		annotations: make(map[Pair]*roaring.Bitmap),
+		indexes:     make(map[string]uint32),
+	}
+
+	it := skl.NewIterator()
+	defer it.Close()
+
+	for it.SeekToLast(); it.Valid(); it.Prev() {
+		event := &storagepb.Event{}
+		if err := proto.Unmarshal(it.Value().Value, event); err != nil {
+			return nil, err
+		}
+
+		k := it.Key()
+
+		ri.keys = append(ri.keys, k)
+		index := uint32(len(ri.keys) - 1)
+		ri.all.Add(index)
+		ri.indexes[string(k)] = index
+
+		ri.startTime.SetValue(uint64(index), event.StartTime.AsTime().Unix())
+		ri.endTime.SetValue(uint64(index), event.EndTime.AsTime().Unix())
+
+		for _, tag := range event.Tags {
+			if _, ok := ri.tags[tag]; !ok {
+				ri.tags[tag] = roaring.New()
+			}
+			ri.tags[tag].Add(index)
+		}
+
+		for key, value := range event.Annotations {
+			pair := Pair{Key: key, Value: value}
+			if _, ok := ri.annotations[pair]; !ok {
+				ri.annotations[pair] = roaring.New()
+			}
+			ri.annotations[pair].Add(index)
+		}
+	}
+
+	return ri, nil
+}
+
+func fromBboltKeys(db *bbolt.DB, bucket []byte, keys [][]byte) (*roaringIndex, error) {
+	ri := &roaringIndex{
+		all:         roaring.New(),
+		startTime:   bsi.NewDefaultBSI(),
+		endTime:     bsi.NewDefaultBSI(),
+		tags:        make(map[string]*roaring.Bitmap),
+		annotations: make(map[Pair]*roaring.Bitmap),
+		indexes:     make(map[string]uint32),
+	}
+
+	err := db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucket)
+
+		for _, k := range keys {
+			v := bucket.Get(k)
+
 			event := &storagepb.Event{}
 			if err := proto.Unmarshal(v, event); err != nil {
 				return err

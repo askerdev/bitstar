@@ -8,29 +8,22 @@ import (
 	"github.com/askerdev/bitstar/filtering"
 )
 
-type Query struct {
+type IndexQuery struct {
 	PageSize  int
 	PageToken string
 	StartTime time.Time
 	EndTime   time.Time
-	Filter    string
-
-	lastKey []byte
+	Filter    *filtering.Filter
 }
 
-func (q *Query) Do(ris []*roaringIndex) ([][]byte, error) {
-	filter, err := filtering.ParseFilter(q.Filter)
-	if err != nil {
-		return nil, err
-	}
-
-	keys := make([][]byte, 0, q.PageSize)
+func (iq *IndexQuery) Do(ris []*roaringIndex) ([][]byte, bool, error) {
+	keys := make([][]byte, 0, iq.PageSize)
 
 	var pageTokenKey []byte
-	if len(q.PageToken) > 0 {
-		buf, err := base64.StdEncoding.DecodeString(q.PageToken)
+	if len(iq.PageToken) > 0 {
+		buf, err := base64.StdEncoding.DecodeString(iq.PageToken)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		pageTokenKey = buf
 	}
@@ -41,9 +34,9 @@ func (q *Query) Do(ris []*roaringIndex) ([][]byte, error) {
 			continue
 		}
 
-		posting, err := ri.query(q.StartTime, q.EndTime, filter)
+		posting, err := ri.query(iq.StartTime, iq.EndTime, iq.Filter)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		it := posting.Iterator()
@@ -57,32 +50,26 @@ func (q *Query) Do(ris []*roaringIndex) ([][]byte, error) {
 			}
 		}
 
-		page := make([][]byte, 0, q.PageSize)
+		page := make([][]byte, 0, iq.PageSize)
 
-		for it.HasNext() && len(page) < int(q.PageSize) {
+		for it.HasNext() && len(page) < int(iq.PageSize) {
 			nextKey := ri.keys[it.Next()]
 			page = append(page, nextKey)
 		}
 
 		currentTotalLen := len(keys) + len(page)
 
-		keys = mergeKeys(keys, page, q.PageSize)
+		keys = mergeKeysLimited(keys, page, iq.PageSize)
 
 		if currentTotalLen > len(keys) || it.HasNext() {
 			hasNext = true
 		}
 	}
 
-	if hasNext && len(keys) > 0 {
-		q.lastKey = keys[len(keys)-1]
-	} else {
-		q.lastKey = nil
-	}
-
-	return keys, nil
+	return keys, hasNext, nil
 }
 
-func mergeKeys(a, b [][]byte, pageSize int) [][]byte {
+func mergeKeysLimited(a, b [][]byte, pageSize int) [][]byte {
 	c := make([][]byte, 0, pageSize)
 
 	i, j := 0, 0
@@ -110,9 +97,30 @@ func mergeKeys(a, b [][]byte, pageSize int) [][]byte {
 	return c
 }
 
-func (q *Query) NextPageToken() string {
-	if len(q.lastKey) == 0 {
-		return ""
+func mergeKeys(a, b [][]byte) [][]byte {
+	c := make([][]byte, 0, len(a)+len(b))
+
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		compare := bytes.Compare(a[i], b[j])
+		if compare >= 0 {
+			c = append(c, a[i])
+			i++
+		} else {
+			c = append(c, b[j])
+			j++
+		}
 	}
-	return base64.StdEncoding.EncodeToString(q.lastKey)
+
+	for i < len(a) {
+		c = append(c, a[i])
+		i++
+	}
+
+	for j < len(b) {
+		c = append(c, b[j])
+		j++
+	}
+
+	return c
 }

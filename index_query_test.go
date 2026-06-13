@@ -1,17 +1,19 @@
 package bitstar
 
 import (
+	"encoding/base64"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func TestQuery_Do(t *testing.T) {
+func TestIndexQuery_Do(t *testing.T) {
 	bucketName := []byte("events")
 
 	now := time.Now().Truncate(time.Second)
@@ -80,15 +82,15 @@ func TestQuery_Do(t *testing.T) {
 	}
 
 	tc := []struct {
-		q    *Query
+		q    *IndexQuery
 		want []*storagepb.Event
 	}{
 		{
-			q: &Query{
+			q: &IndexQuery{
 				StartTime: now,
 				EndTime:   now,
 				PageSize:  2,
-				Filter:    `tags = "backend"`,
+				Filter:    parseFilter(t, `tags = "backend"`),
 			},
 			want: []*storagepb.Event{
 				events[0][0],
@@ -97,7 +99,7 @@ func TestQuery_Do(t *testing.T) {
 			},
 		},
 		{
-			q: &Query{
+			q: &IndexQuery{
 				StartTime: now,
 				EndTime:   now,
 				PageSize:  2,
@@ -115,20 +117,19 @@ func TestQuery_Do(t *testing.T) {
 
 	for i, tt := range tc {
 		t.Run(fmt.Sprintf("#%d", i), func(t *testing.T) {
-			keys, err := tt.q.Do(ris)
+			keys, hasNext, err := tt.q.Do(ris)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			nextPageToken := tt.q.NextPageToken()
-			for nextPageToken != "" {
-				tt.q.PageToken = nextPageToken
-				nextKeys, err := tt.q.Do(ris)
+			for hasNext {
+				tt.q.PageToken = base64.StdEncoding.EncodeToString(keys[len(keys)-1])
+				nextKeys, localHasNext, err := tt.q.Do(ris)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
 				keys = append(keys, nextKeys...)
-				nextPageToken = tt.q.NextPageToken()
+				hasNext = localHasNext
 			}
 
 			gotKeysPretty := make([]string, 0, len(keys))
@@ -154,4 +155,13 @@ func TestQuery_Do(t *testing.T) {
 			}
 		})
 	}
+}
+
+func parseFilter(t testing.TB, filter string) *filtering.Filter {
+	t.Helper()
+	f, err := filtering.ParseFilter(filter)
+	if err != nil {
+		t.Fatalf("parse filter fail: %v", err)
+	}
+	return f
 }
