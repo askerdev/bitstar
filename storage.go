@@ -31,14 +31,19 @@ var (
 	}
 )
 
+type writeItem struct {
+	key  []byte
+	val  []byte
+	item *memTableItem
+}
+
 type writeRequest struct {
-	in  *storagepb.BatchCreateEventsRequest
+	in  []*writeItem
 	rsp chan writeResponse
 }
 
 type writeResponse struct {
-	events []*storagepb.Event
-	err    error
+	err error
 }
 
 type Storage struct {
@@ -108,12 +113,7 @@ func (s *Storage) writeWorker() {
 	for {
 		select {
 		case req := <-s.writeCh:
-			events, err := s.batchCreateEvents(req.in)
-
-			req.rsp <- writeResponse{
-				events: events,
-				err:    err,
-			}
+			req.rsp <- writeResponse{err: s.batchCreateEvents(req.in)}
 		case table := <-s.compactDoneCh:
 			oldSlice := *s.pen.Load()
 			idx := -1
@@ -198,8 +198,33 @@ func (s *Storage) compact(table *memTable) error {
 func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCreateEventsRequest) (*storagepb.BatchCreateEventsResponse, error) {
 	resCh := make(chan writeResponse, 1)
 
+	events := make([]*storagepb.Event, 0, len(in.GetRequests()))
+	batch := make([]*writeItem, 0, len(in.GetRequests()))
+
+	for _, request := range in.GetRequests() {
+		id := uuid.Must(uuid.NewV7())
+		request.Event.Id = id.String()
+
+		events = append(events, request.Event)
+
+		key := encodeKey(request.Event.StartTime.AsTime(), id)
+
+		val, err := proto.Marshal(request.Event)
+		if err != nil {
+			return nil, err
+		}
+
+		item := newMemTableItem(request.Event)
+
+		batch = append(batch, &writeItem{
+			key:  key,
+			val:  val,
+			item: item,
+		})
+	}
+
 	select {
-	case s.writeCh <- writeRequest{in: in, rsp: resCh}:
+	case s.writeCh <- writeRequest{in: batch, rsp: resCh}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -209,40 +234,26 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 		if res.err != nil {
 			return nil, status.Errorf(codes.Internal, "write fail: %v", res.err)
 		}
-		return &storagepb.BatchCreateEventsResponse{Events: res.events}, nil
+		return &storagepb.BatchCreateEventsResponse{Events: events}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-func (s *Storage) batchCreateEvents(in *storagepb.BatchCreateEventsRequest) ([]*storagepb.Event, error) {
-	events := make([]*storagepb.Event, 0, len(in.GetRequests()))
-
+func (s *Storage) batchCreateEvents(in []*writeItem) error {
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(eventsBucket)
 
-		for _, request := range in.GetRequests() {
-			id := uuid.Must(uuid.NewV7())
-			request.Event.Id = id.String()
-
-			key := encodeKey(request.Event.StartTime.AsTime(), id)
-
-			val, err := proto.Marshal(request.Event)
-			if err != nil {
+		for _, wi := range in {
+			if err := bucket.Put(wi.key, wi.val); err != nil {
 				return err
 			}
-
-			if err := bucket.Put(key, val); err != nil {
-				return err
-			}
-
-			events = append(events, request.Event)
 		}
 
 		return nil
 	})
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "batch create fail: %v", err)
+		return status.Errorf(codes.Internal, "batch create fail: %v", err)
 	}
 
 	curTable := s.cur.Load()
@@ -269,15 +280,13 @@ func (s *Storage) batchCreateEvents(in *storagepb.BatchCreateEventsRequest) ([]*
 		curTable.wg.Add(1)
 	}
 
-	curTable.mu.Lock()
-	for _, event := range events {
-		curTable.put(event)
+	for _, wi := range in {
+		curTable.putItem(wi.item)
 	}
-	curTable.mu.Unlock()
 
 	curTable.wg.Done()
 
-	return events, nil
+	return nil
 }
 
 func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsRequest) (*storagepb.ListEventsResponse, error) {

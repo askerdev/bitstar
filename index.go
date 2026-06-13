@@ -226,9 +226,6 @@ func fromBbolt(db *bbolt.DB, bucket []byte) (*roaringIndex, error) {
 func fromMemTable(mt *memTable) (*roaringIndex, error) {
 	ri := newRoaringIndex()
 
-	mt.mu.RLock()
-	defer mt.mu.RUnlock()
-
 	slices.SortFunc(mt.items, func(a, b *memTableItem) int {
 		timeA := a.event.StartTime.AsTime()
 		timeB := b.event.StartTime.AsTime()

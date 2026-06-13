@@ -8,12 +8,14 @@ import (
 	"log"
 	"math"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
 	"github.com/google/uuid"
 	"go.ytsaurus.tech/yt/go/yson"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -193,7 +195,7 @@ func main() {
 		rowCount++
 
 		if len(batch) >= batchSize {
-			_, err := client.BatchCreateEvents(context.Background(), &storagepb.BatchCreateEventsRequest{Requests: batch})
+			err := writeBatch(client, context.Background(), batch)
 			if err != nil {
 				log.Printf("batch insert error: %v", err)
 				errorCount += int64(len(batch))
@@ -210,7 +212,7 @@ func main() {
 	}
 
 	if len(batch) > 0 {
-		_, err := client.BatchCreateEvents(context.Background(), &storagepb.BatchCreateEventsRequest{Requests: batch})
+		err := writeBatch(client, context.Background(), batch)
 		if err != nil {
 			log.Printf("final batch insert error: %v", err)
 			errorCount += int64(len(batch))
@@ -225,6 +227,22 @@ func main() {
 	fmt.Printf("Errors encountered: %d\n", errorCount)
 	fmt.Printf("Total time: %v\n", elapsed)
 	fmt.Printf("Average rate: %.0f rows/sec\n", float64(rowCount)/elapsed.Seconds())
+}
+
+func writeBatch(client storagepb.EventServiceClient, _ context.Context, in []*storagepb.CreateEventRequest) error {
+	eg := &errgroup.Group{}
+	chunks := slices.Chunk(in, 512)
+	for chunk := range chunks {
+		eg.Go(func() error {
+			start := time.Now()
+			_, err := client.BatchCreateEvents(context.Background(), &storagepb.BatchCreateEventsRequest{Requests: chunk})
+			if err == nil {
+				fmt.Println("wrote batch, elapsed", time.Since(start).String())
+			}
+			return err
+		})
+	}
+	return eg.Wait()
 }
 
 func resourceTypeCode(resourceType string) string {

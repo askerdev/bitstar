@@ -39,8 +39,7 @@ func (mq *MemTableQuery) Do(mts []*memTable) ([][]byte, bool, error) {
 	boundedSize := mq.PageSize + 1
 
 	for _, mt := range mts {
-		mt.mu.RLock()
-		for _, item := range mt.items {
+		for _, item := range mt.items[:mt.count] {
 			ev := item.event
 			evStart := ev.StartTime.AsTime()
 			evEnd := ev.EndTime.AsTime()
@@ -77,7 +76,6 @@ func (mq *MemTableQuery) Do(mts []*memTable) ([][]byte, bool, error) {
 				}
 			}
 		}
-		mt.mu.RUnlock()
 	}
 
 	hasNext := h.Len() > mq.PageSize
