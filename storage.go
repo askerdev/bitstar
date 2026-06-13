@@ -34,15 +34,28 @@ var (
 	}
 )
 
+type writeRequest struct {
+	in  *storagepb.BatchCreateEventsRequest
+	rsp chan writeResponse
+}
+
+type writeResponse struct {
+	events []*storagepb.Event
+	err    error
+}
+
 type Storage struct {
-	cur       atomic.Pointer[MemTable]
-	pen       atomic.Pointer[[]*MemTable]
-	compactCh chan *MemTable
-	stopCh    chan struct{}
-	doneCh    chan struct{}
-	mu        sync.Mutex
-	db        *bbolt.DB
-	levels    atomic.Pointer[[4]*roaringIndex]
+	cur           atomic.Pointer[MemTable]
+	pen           atomic.Pointer[[]*MemTable]
+	compactCh     chan *MemTable
+	compactDoneCh chan *MemTable
+	levels        atomic.Pointer[[4]*roaringIndex]
+
+	db      *bbolt.DB
+	writeCh chan writeRequest
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
+	doneCh  chan struct{}
 }
 
 func Open(path string) (*Storage, error) {
@@ -56,60 +69,96 @@ func Open(path string) (*Storage, error) {
 		return err
 	})
 	if err != nil {
+		db.Close()
 		return nil, err
 	}
 
 	ri, err := fromBbolt(db, eventsBucket)
 	if err != nil {
+		db.Close()
 		return nil, err
 	}
 
 	s := &Storage{
-		db:        db,
-		stopCh:    make(chan struct{}, 1),
-		doneCh:    make(chan struct{}, 1),
-		compactCh: make(chan *MemTable, 8),
+		db:            db,
+		writeCh:       make(chan writeRequest),
+		stopCh:        make(chan struct{}, 1),
+		doneCh:        make(chan struct{}, 1),
+		compactCh:     make(chan *MemTable, 8),
+		compactDoneCh: make(chan *MemTable, 8),
 	}
 
-	s.cur.Store(&MemTable{
-		skl: skl.NewSkiplist(arenaSize),
-	})
-
+	s.cur.Store(&MemTable{skl: skl.NewSkiplist(arenaSize)})
 	s.pen.Store(&[]*MemTable{})
 
 	s.levels.Store(&[4]*roaringIndex{nil, nil, nil, ri})
 
-	go s.flushWorker(30 * time.Second)
+	s.wg.Go(func() {
+		s.flushWorker(30 * time.Second)
+	})
+	s.wg.Go(func() {
+		s.writeWorker()
+	})
 
 	return s, nil
 }
 
 func (s *Storage) Close() error {
 	s.stopCh <- struct{}{}
-	<-s.doneCh
+	s.stopCh <- struct{}{}
+	s.wg.Wait()
 	return s.db.Close()
+}
+
+func (s *Storage) writeWorker() {
+	for {
+		select {
+		case req := <-s.writeCh:
+			events, err := s.batchCreateEvents(req.in)
+
+			req.rsp <- writeResponse{
+				events: events,
+				err:    err,
+			}
+		case table := <-s.compactDoneCh:
+			oldSlice := *s.pen.Load()
+			idx := -1
+			for i, t := range oldSlice {
+				if t == table {
+					idx = i
+					break
+				}
+			}
+			if idx != -1 {
+				newSlice := make([]*MemTable, 0, len(oldSlice)-1)
+				newSlice = append(newSlice, oldSlice[:idx]...)
+				newSlice = append(newSlice, oldSlice[idx+1:]...)
+
+				s.pen.Store(&newSlice)
+			}
+		case <-s.stopCh:
+			return
+		}
+	}
 }
 
 func (s *Storage) flushWorker(cron time.Duration) {
 	ticker := time.NewTicker(cron)
 	defer ticker.Stop()
 
-LOOP:
 	for {
 		select {
 		case <-ticker.C:
-			tables := s.pen.Load()
-			for _, table := range *tables {
+			pen := s.pen.Load()
+			for _, table := range *pen {
 				s.compact(table)
 			}
 		case table := <-s.compactCh:
 			s.compact(table)
 		case <-s.stopCh:
-			break LOOP
+			return
 		}
 	}
-
-	s.doneCh <- struct{}{}
 }
 
 func (s *Storage) compact(table *MemTable) error {
@@ -146,47 +195,37 @@ func (s *Storage) compact(table *MemTable) error {
 	}
 
 	s.levels.Store(&levels)
-	s.removeFromPending(table)
+
+	s.compactDoneCh <- table
 
 	return nil
 }
 
-func (s *Storage) removeFromPending(table *MemTable) {
-	for {
-		oldSlicePtr := s.pen.Load()
-		if oldSlicePtr == nil {
-			return
-		}
-		oldSlice := *oldSlicePtr
+func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCreateEventsRequest) (*storagepb.BatchCreateEventsResponse, error) {
+	resCh := make(chan writeResponse, 1)
 
-		idx := -1
-		for i, t := range oldSlice {
-			if t == table {
-				idx = i
-				break
-			}
-		}
+	select {
+	case s.writeCh <- writeRequest{in: in, rsp: resCh}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
-		if idx == -1 {
-			break
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			return nil, status.Errorf(codes.Internal, "write fail: %v", res.err)
 		}
-
-		newSlice := make([]*MemTable, 0, len(oldSlice)-1)
-		newSlice = append(newSlice, oldSlice[:idx]...)
-		newSlice = append(newSlice, oldSlice[idx+1:]...)
-
-		if s.pen.CompareAndSwap(oldSlicePtr, &newSlice) {
-			break
-		}
+		return &storagepb.BatchCreateEventsResponse{Events: res.events}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
-func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCreateEventsRequest) (*storagepb.BatchCreateEventsResponse, error) {
-	events := []*storagepb.Event{}
-
+func (s *Storage) batchCreateEvents(in *storagepb.BatchCreateEventsRequest) ([]*storagepb.Event, error) {
+	events := make([]*storagepb.Event, 0, len(in.GetRequests()))
 	pairs := make([]BytePair, 0, len(in.GetRequests()))
 
-	err := s.db.Batch(func(tx *bbolt.Tx) error {
+	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(eventsBucket)
 
 		for _, request := range in.GetRequests() {
@@ -205,10 +244,8 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 			}
 
 			events = append(events, request.Event)
-			pairs = append(pairs, BytePair{
-				Key: key,
-				Val: val,
-			})
+
+			pairs = append(pairs, BytePair{Key: key, Val: val})
 		}
 
 		return nil
@@ -228,45 +265,33 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 
 	if curTable.skl.MemSize()+batchAllocSize >= threshold {
 		curTable.wg.Done()
+
 		newTable := &MemTable{skl: skl.NewSkiplist(arenaSize)}
-		if s.cur.CompareAndSwap(curTable, newTable) {
-			select {
-			case s.compactCh <- curTable:
-			default:
-			}
+		s.cur.Store(newTable)
 
-			for {
-				oldSlicePtr := s.pen.Load()
-				oldSlice := *oldSlicePtr
-
-				newSlice := make([]*MemTable, len(oldSlice)+1)
-				copy(newSlice, oldSlice)
-				newSlice[len(oldSlice)] = curTable
-
-				if s.pen.CompareAndSwap(oldSlicePtr, &newSlice) {
-					break
-				}
-			}
-			curTable = newTable
-		} else {
-			curTable = s.cur.Load()
+		select {
+		case s.compactCh <- curTable:
+		default:
 		}
+
+		oldSlice := *s.pen.Load()
+		newSlice := make([]*MemTable, len(oldSlice)+1)
+		copy(newSlice, oldSlice)
+		newSlice[len(oldSlice)] = curTable
+
+		s.pen.Store(&newSlice)
+
+		curTable = newTable
+
 		curTable.wg.Add(1)
 	}
 
 	for _, pair := range pairs {
-		curTable.skl.Put(pair.Key, y.ValueStruct{
-			Value:    pair.Val,
-			Meta:     0,
-			UserMeta: 0,
-		})
+		curTable.skl.Put(pair.Key, y.ValueStruct{Value: pair.Val})
 	}
-
 	curTable.wg.Done()
 
-	return &storagepb.BatchCreateEventsResponse{
-		Events: events,
-	}, nil
+	return events, nil
 }
 
 func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsRequest) (*storagepb.ListEventsResponse, error) {
