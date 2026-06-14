@@ -21,12 +21,10 @@ import (
 )
 
 const (
-	maxMemTableSize = 64_000
+	maxMemTableSize = 16_384
 )
 
 var (
-	eventsBucket = []byte("events")
-
 	levelLimit = map[int]uint32{
 		0: 256_000,
 		1: 1_024_000,
@@ -49,9 +47,9 @@ type writeResponse struct {
 
 type Storage struct {
 	cur           atomic.Pointer[memTable]
-	pen           atomic.Pointer[[]*memTable]
-	compactCh     chan *memTable
-	compactDoneCh chan *memTable
+	pen           atomic.Pointer[[]*roaringIndex]
+	compactCh     chan struct{}
+	compactDoneCh chan *roaringIndex
 	levels        atomic.Pointer[[4]*roaringIndex]
 
 	db      *ydb.Driver
@@ -70,12 +68,12 @@ func Open(ctx context.Context, db *ydb.Driver) (*Storage, error) {
 		db:            db,
 		writeCh:       make(chan writeRequest),
 		stopCh:        make(chan struct{}, 2),
-		compactCh:     make(chan *memTable, 8),
-		compactDoneCh: make(chan *memTable, 8),
+		compactCh:     make(chan struct{}),
+		compactDoneCh: make(chan *roaringIndex),
 	}
 
 	s.cur.Store(newMemTable())
-	s.pen.Store(&[]*memTable{})
+	s.pen.Store(&[]*roaringIndex{})
 
 	s.levels.Store(&[4]*roaringIndex{nil, nil, nil, ri})
 
@@ -98,19 +96,41 @@ func (s *Storage) Close() error {
 func (s *Storage) writeWorker() {
 	for {
 		select {
-		case req := <-s.writeCh:
-			req.rsp <- writeResponse{err: s.batchCreateEvents(req.in)}
-		case table := <-s.compactDoneCh:
+		case ri := <-s.compactDoneCh:
 			oldSlice := *s.pen.Load()
 			idx := -1
 			for i, t := range oldSlice {
-				if t == table {
+				if t == ri {
 					idx = i
 					break
 				}
 			}
 			if idx != -1 {
-				newSlice := make([]*memTable, 0, len(oldSlice)-1)
+				newSlice := make([]*roaringIndex, 0, len(oldSlice)-1)
+				newSlice = append(newSlice, oldSlice[:idx]...)
+				newSlice = append(newSlice, oldSlice[idx+1:]...)
+
+				s.pen.Store(&newSlice)
+			}
+		case <-s.stopCh:
+			return
+		default:
+		}
+
+		select {
+		case req := <-s.writeCh:
+			req.rsp <- writeResponse{err: s.batchCreateEvents(req.in)}
+		case ri := <-s.compactDoneCh:
+			oldSlice := *s.pen.Load()
+			idx := -1
+			for i, t := range oldSlice {
+				if t == ri {
+					idx = i
+					break
+				}
+			}
+			if idx != -1 {
+				newSlice := make([]*roaringIndex, 0, len(oldSlice)-1)
 				newSlice = append(newSlice, oldSlice[:idx]...)
 				newSlice = append(newSlice, oldSlice[idx+1:]...)
 
@@ -123,38 +143,37 @@ func (s *Storage) writeWorker() {
 }
 
 func (s *Storage) flushWorker(cron time.Duration) {
-	ticker := time.NewTicker(cron)
-	defer ticker.Stop()
+	c := 0
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-time.After(cron):
 			pen := s.pen.Load()
 			for _, table := range *pen {
-				s.compact(table)
+				s.mergeLevel(table)
 			}
-		case table := <-s.compactCh:
-			s.compact(table)
+		case <-s.compactCh:
+			c++
+			if c >= 4 {
+				c = 0
+				pen := s.pen.Load()
+				for _, ri := range *pen {
+					s.mergeLevel(ri)
+				}
+			}
 		case <-s.stopCh:
 			return
 		}
 	}
 }
 
-func (s *Storage) compact(table *memTable) error {
-	table.wg.Wait()
-
+func (s *Storage) mergeLevel(ri *roaringIndex) error {
 	levelsPtr := s.levels.Load()
 	levels := [4]*roaringIndex{
 		levelsPtr[0],
 		levelsPtr[1],
 		levelsPtr[2],
 		levelsPtr[3],
-	}
-
-	ri, err := fromMemTable(table)
-	if err != nil {
-		return err
 	}
 
 	if levels[0] == nil {
@@ -176,7 +195,7 @@ func (s *Storage) compact(table *memTable) error {
 
 	s.levels.Store(&levels)
 
-	s.compactDoneCh <- table
+	s.compactDoneCh <- ri
 
 	return nil
 }
@@ -255,16 +274,19 @@ func (s *Storage) batchCreateEvents(in []*writeItem) error {
 		newTable := newMemTable()
 		s.cur.Store(newTable)
 
-		select {
-		case s.compactCh <- curTable:
-		default:
-		}
+		curTable.wg.Wait()
+		ri, _ := fromMemTable(curTable)
 
 		oldSlice := *s.pen.Load()
-		newSlice := make([]*memTable, len(oldSlice)+1)
+		newSlice := make([]*roaringIndex, len(oldSlice)+1)
 		copy(newSlice, oldSlice)
-		newSlice[len(oldSlice)] = curTable
+		newSlice[len(oldSlice)] = ri
 		s.pen.Store(&newSlice)
+
+		select {
+		case s.compactCh <- struct{}{}:
+		default:
+		}
 
 		curTable = newTable
 		curTable.wg.Add(1)
@@ -289,6 +311,29 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 	snapshotPen := s.pen.Load()
 	snapshotLevels := s.levels.Load()
 
+	stats := &storagepb.Stats{
+		CurrentMemTableSize:       int32(snapshotCur.count),
+		PendingIndexCount:         int32(len(*snapshotPen)),
+		PendingIndexCardinalities: make(map[int32]int32),
+		LevelCardinalities:        make(map[int32]int32),
+	}
+
+	for i, ri := range *snapshotPen {
+		if ri == nil {
+			stats.PendingIndexCardinalities[int32(i)] = 0
+		} else {
+			stats.PendingIndexCardinalities[int32(i)] = int32(ri.all.GetCardinality())
+		}
+	}
+
+	for i, ri := range *snapshotLevels {
+		if ri == nil {
+			stats.LevelCardinalities[int32(i)] = 0
+		} else {
+			stats.LevelCardinalities[int32(i)] = int32(ri.all.GetCardinality())
+		}
+	}
+
 	eg := &errgroup.Group{}
 
 	var scanKeys []EventKey
@@ -303,13 +348,7 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 			Filter:    filter,
 		}
 
-		mts := make([]*memTable, 0, 1+len(*snapshotPen))
-		mts = append(mts, snapshotCur)
-		for _, mt := range *snapshotPen {
-			mts = append(mts, mt)
-		}
-
-		keys, hasNext, err := sq.Do(mts)
+		keys, hasNext, err := sq.Do([]*memTable{snapshotCur})
 		if err != nil {
 			return err
 		}
@@ -333,8 +372,11 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 		}
 
 		levels := *snapshotLevels
+		ris := make([]*roaringIndex, 0, len(levels)+len(*snapshotPen))
+		ris = append(ris, (*snapshotLevels)[:]...)
+		ris = append(ris, *snapshotPen...)
 
-		keys, hasNext, err := iq.Do(levels[:])
+		keys, hasNext, err := iq.Do(ris)
 		if err != nil {
 			return err
 		}
@@ -351,7 +393,7 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 
 	keys := mergeKeysLimited(scanKeys, indexKeys, int(in.GetPageSize()))
 	if len(keys) == 0 {
-		return &storagepb.ListEventsResponse{}, nil
+		return &storagepb.ListEventsResponse{Stats: stats}, nil
 	}
 
 	tableKeys := make([]types.Value, 0, len(keys))
@@ -406,5 +448,6 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 	return &storagepb.ListEventsResponse{
 		Events:        events,
 		NextPageToken: nextPageToken,
+		Stats:         stats,
 	}, nil
 }

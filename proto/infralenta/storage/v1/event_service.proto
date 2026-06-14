@@ -79,4 +79,13 @@ message ListEventsResponse {
   repeated Event events = 1;
 
   string next_page_token = 2;
+
+  Stats stats = 3;
+}
+
+message Stats {
+  int32 current_mem_table_size = 1;
+  int32 pending_index_count = 2;
+  map<int32, int32> pending_index_cardinalities = 3;
+  map<int32, int32> level_cardinalities = 4;
 }

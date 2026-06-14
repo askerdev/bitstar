@@ -29,6 +29,8 @@ func (iq *IndexQuery) Do(ris []*roaringIndex) ([]EventKey, bool, error) {
 	boundedSize := iq.PageSize + 1
 	keys := make([]EventKey, 0, boundedSize)
 
+	page := make([]EventKey, 0, boundedSize)
+
 	for _, ri := range ris {
 		if ri == nil {
 			continue
@@ -50,7 +52,7 @@ func (iq *IndexQuery) Do(ris []*roaringIndex) ([]EventKey, bool, error) {
 			}
 		}
 
-		page := make([]EventKey, 0, boundedSize)
+		page = page[:0]
 		for it.HasNext() && len(page) < boundedSize {
 			nextKey := ri.keys[it.Next()]
 			page = append(page, nextKey)

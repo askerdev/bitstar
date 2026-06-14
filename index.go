@@ -413,8 +413,6 @@ func moveBitmap(src *roaring.Bitmap, remap []uint32, dst *roaring.Bitmap) {
 		buf[i] = remap[buf[i]]
 	}
 
-	slices.Sort(buf)
-
 	dst.AddMany(buf)
 }
 

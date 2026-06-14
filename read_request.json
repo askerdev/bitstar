@@ -1,0 +1,7 @@
+{
+	"page_size": 12,
+	"page_token": "CiEKD2FiY19hcHBsaWNhdGlvbhIOaWRwLXB1YmxpYy1hcGkSBgjrsvXNBhokMDE5ZWM4MTEtYTk2OS03ZTZmLWJiNzYtZTY4NjE5MjFjM2Rj",
+	"start_time": "2026-01-01T00:00:00.000Z",
+	"end_time": "2026-06-01T23:59:59.000Z",
+	"filter": "(annotations.resource_type_code = \"abc_application\" AND annotations.resource_external_id = \"idp-public-api\")"
+}
