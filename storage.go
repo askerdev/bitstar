@@ -2,7 +2,8 @@ package bitstar
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/json"
+	"path"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,11 +11,13 @@ import (
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
 	"github.com/google/uuid"
-	"go.etcd.io/bbolt"
+	"github.com/ydb-platform/ydb-go-sdk/v3"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table/types"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -32,8 +35,6 @@ var (
 )
 
 type writeItem struct {
-	key  []byte
-	val  []byte
 	item *memTableItem
 }
 
@@ -53,30 +54,15 @@ type Storage struct {
 	compactDoneCh chan *memTable
 	levels        atomic.Pointer[[4]*roaringIndex]
 
-	db      *bbolt.DB
+	db      *ydb.Driver
 	writeCh chan writeRequest
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 }
 
-func Open(path string) (*Storage, error) {
-	db, err := bbolt.Open(path, 0600, nil)
+func Open(ctx context.Context, db *ydb.Driver) (*Storage, error) {
+	ri, err := fromYdb(ctx, db)
 	if err != nil {
-		return nil, err
-	}
-
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(eventsBucket)
-		return err
-	})
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-
-	ri, err := fromBbolt(db, eventsBucket)
-	if err != nil {
-		db.Close()
 		return nil, err
 	}
 
@@ -106,7 +92,7 @@ func Open(path string) (*Storage, error) {
 func (s *Storage) Close() error {
 	close(s.stopCh)
 	s.wg.Wait()
-	return s.db.Close()
+	return nil
 }
 
 func (s *Storage) writeWorker() {
@@ -200,27 +186,46 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 
 	events := make([]*storagepb.Event, 0, len(in.GetRequests()))
 	batch := make([]*writeItem, 0, len(in.GetRequests()))
+	rows := make([]types.Value, 0, len(in.GetRequests()))
 
-	for _, request := range in.GetRequests() {
+	for _, req := range in.GetRequests() {
 		id := uuid.Must(uuid.NewV7())
-		request.Event.Id = id.String()
+		event := req.GetEvent()
+		event.Id = id.String()
 
-		events = append(events, request.Event)
+		tags, _ := json.Marshal(event.Tags)
+		annotations, _ := json.Marshal(event.Annotations)
 
-		key := encodeKey(request.Event.StartTime.AsTime(), id)
+		rows = append(rows,
+			types.StructValue(
+				types.StructFieldValue("resource_type_code", types.UTF8Value(event.GetResource().GetTypeCode())),
+				types.StructFieldValue("resource_external_id", types.UTF8Value(event.GetResource().GetExternalId())),
+				types.StructFieldValue("start_time", types.TimestampValueFromTime(event.GetStartTime().AsTime())),
+				types.StructFieldValue("id", types.UuidValue(id)),
+				types.StructFieldValue("title", types.UTF8Value(event.GetTitle())),
+				types.StructFieldValue("description", types.UTF8Value(event.GetDescription())),
+				types.StructFieldValue("end_time", types.TimestampValueFromTime(event.GetEndTime().AsTime())),
+				types.StructFieldValue("tags", types.JSONValueFromBytes(tags)),
+				types.StructFieldValue("annotations", types.JSONValueFromBytes(annotations)),
+				types.StructFieldValue("created_by", types.BytesValue([]byte(event.GetCreatedBy()))),
+				types.StructFieldValue("updated_by", types.BytesValue([]byte(event.GetUpdatedBy()))),
+				types.StructFieldValue("create_time", types.TimestampValueFromTime(event.GetCreateTime().AsTime())),
+				types.StructFieldValue("update_time", types.TimestampValueFromTime(event.GetUpdateTime().AsTime())),
+			),
+		)
 
-		val, err := proto.Marshal(request.Event)
-		if err != nil {
-			return nil, err
-		}
+		batch = append(batch, &writeItem{item: newMemTableItem(event)})
+	}
 
-		item := newMemTableItem(request.Event)
-
-		batch = append(batch, &writeItem{
-			key:  key,
-			val:  val,
-			item: item,
-		})
+	err := s.db.Table().
+		BulkUpsert(
+			ctx,
+			path.Join(s.db.Name(), "events"),
+			table.BulkUpsertDataRows(types.ListValue(rows...)),
+			table.WithIdempotent(),
+		)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "write fail: %v", err)
 	}
 
 	select {
@@ -241,21 +246,6 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 }
 
 func (s *Storage) batchCreateEvents(in []*writeItem) error {
-	err := s.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(eventsBucket)
-
-		for _, wi := range in {
-			if err := bucket.Put(wi.key, wi.val); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-	if err != nil {
-		return status.Errorf(codes.Internal, "batch create fail: %v", err)
-	}
-
 	curTable := s.cur.Load()
 	curTable.wg.Add(1)
 
@@ -301,7 +291,7 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 
 	eg := &errgroup.Group{}
 
-	var scanKeys [][]byte
+	var scanKeys []EventKey
 	var hasScanNext bool
 
 	eg.Go(func() error {
@@ -330,7 +320,7 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 		return nil
 	})
 
-	var indexKeys [][]byte
+	var indexKeys []EventKey
 	var hasIndexNext bool
 
 	eg.Go(func() error {
@@ -360,27 +350,57 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 	}
 
 	keys := mergeKeysLimited(scanKeys, indexKeys, int(in.GetPageSize()))
+	if len(keys) == 0 {
+		return &storagepb.ListEventsResponse{}, nil
+	}
 
-	events := make([]*storagepb.Event, 0, len(keys))
+	tableKeys := make([]types.Value, 0, len(keys))
+	for _, key := range keys {
+		tableKeys = append(tableKeys, types.StructValue(
+			types.StructFieldValue("resource_type_code", types.UTF8Value(key.ResourceTypeCode)),
+			types.StructFieldValue("resource_external_id", types.UTF8Value(key.ResourceExternalID)),
+			types.StructFieldValue("start_time", types.TimestampValueFromTime(key.StartTime)),
+			types.StructFieldValue("id", types.UuidValue(uuid.MustParse(key.ID))),
+		))
+	}
 
-	err = s.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(eventsBucket)
-		for _, key := range keys {
-			event := &storagepb.Event{}
-			if err := proto.Unmarshal(bucket.Get(key), event); err != nil {
-				return err
-			}
-			events = append(events, event)
-		}
-		return nil
-	})
+	opts := []options.ReadRowsOption{options.ReadColumns(eventsCols...)}
+
+	result, err := s.db.Table().
+		ReadRows(
+			ctx,
+			path.Join(s.db.Name(), "events"),
+			types.ListValue(tableKeys...),
+			opts,
+			table.WithIdempotent(),
+		)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list fail: %v", err)
 	}
 
+	eventsMap := make(map[string]*storagepb.Event, len(keys))
+	err = forEachEvent(ctx, result, func(event *storagepb.Event) error {
+		eventsMap[event.Id] = event
+		return nil
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "scan fail: %v", err)
+	}
+
+	events := make([]*storagepb.Event, 0, len(keys))
+	for _, key := range keys {
+		if ev, ok := eventsMap[key.ID]; ok {
+			events = append(events, ev)
+		}
+	}
+
 	var nextPageToken string
 	if hasScanNext || hasIndexNext {
-		nextPageToken = base64.StdEncoding.EncodeToString(keys[len(keys)-1])
+		var err error
+		nextPageToken, err = EncodePageToken(keys[len(keys)-1])
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "list fail: %v", err)
+		}
 	}
 
 	return &storagepb.ListEventsResponse{

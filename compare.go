@@ -1,15 +1,11 @@
 package bitstar
 
-type heapItem struct {
-	item *memTableItem
-}
+type eventKeyMinHeap []EventKey
 
-type eventMinHeap []*heapItem
-
-func (h eventMinHeap) Len() int { return len(h) }
-func (h eventMinHeap) Less(i, j int) bool {
-	timeI := h[i].item.event.StartTime.AsTime()
-	timeJ := h[j].item.event.StartTime.AsTime()
+func (h eventKeyMinHeap) Len() int { return len(h) }
+func (h eventKeyMinHeap) Less(i, j int) bool {
+	timeI := h[i].StartTime
+	timeJ := h[j].StartTime
 
 	if timeI.Before(timeJ) {
 		return true
@@ -18,12 +14,12 @@ func (h eventMinHeap) Less(i, j int) bool {
 		return false
 	}
 
-	return h[i].item.event.Id < h[j].item.event.Id
+	return h[i].ID < h[j].ID
 }
 
-func (h eventMinHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *eventMinHeap) Push(x interface{}) { *h = append(*h, x.(*heapItem)) }
-func (h *eventMinHeap) Pop() interface{} {
+func (h eventKeyMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *eventKeyMinHeap) Push(x any)   { *h = append(*h, x.(EventKey)) }
+func (h *eventKeyMinHeap) Pop() any {
 	old := *h
 	n := len(old)
 	x := old[n-1]
@@ -31,14 +27,21 @@ func (h *eventMinHeap) Pop() interface{} {
 	return x
 }
 
-func isNewer(a, b *memTableItem) bool {
-	timeA := a.event.StartTime.AsTime()
-	timeB := b.event.StartTime.AsTime()
-	if timeA.After(timeB) {
-		return true
+func compareEventKey(a, b EventKey) int {
+	if a.StartTime.After(b.StartTime) {
+		return 1
 	}
-	if timeA.Before(timeB) {
-		return false
+	if a.StartTime.Before(b.StartTime) {
+		return -1
 	}
-	return a.event.Id > b.event.Id
+
+	if a.ID > b.ID {
+		return 1
+	}
+
+	if a.ID < b.ID {
+		return -1
+	}
+
+	return 0
 }

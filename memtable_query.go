@@ -2,11 +2,9 @@ package bitstar
 
 import (
 	"container/heap"
-	"encoding/base64"
 	"time"
 
 	"github.com/askerdev/bitstar/filtering"
-	"github.com/google/uuid"
 )
 
 type MemTableQuery struct {
@@ -17,22 +15,18 @@ type MemTableQuery struct {
 	Filter    *filtering.Filter
 }
 
-func (mq *MemTableQuery) Do(mts []*memTable) ([][]byte, bool, error) {
-	h := &eventMinHeap{}
+func (mq *MemTableQuery) Do(mts []*memTable) ([]EventKey, bool, error) {
+	h := &eventKeyMinHeap{}
 	heap.Init(h)
 
-	var tokenTime time.Time
-	var tokenID string
 	var hasToken bool
-
+	var pageTokenKey EventKey
 	if len(mq.PageToken) > 0 {
-		buf, err := base64.StdEncoding.DecodeString(mq.PageToken)
+		eventKey, err := DecodePageToken(mq.PageToken)
 		if err != nil {
 			return nil, false, err
 		}
-		var uuidObj uuid.UUID
-		tokenTime, uuidObj = decodeKey(buf)
-		tokenID = uuidObj.String()
+		pageTokenKey = eventKey
 		hasToken = true
 	}
 
@@ -50,11 +44,11 @@ func (mq *MemTableQuery) Do(mts []*memTable) ([][]byte, bool, error) {
 			}
 
 			if hasToken {
-				if evStart.After(tokenTime) {
+				if evStart.After(pageTokenKey.StartTime) {
 					continue
 				}
-				if evStart.Equal(tokenTime) {
-					if ev.Id >= tokenID {
+				if evStart.Equal(pageTokenKey.StartTime) {
+					if ev.Id >= pageTokenKey.ID {
 						continue
 					}
 				}
@@ -66,12 +60,18 @@ func (mq *MemTableQuery) Do(mts []*memTable) ([][]byte, bool, error) {
 			}
 
 			if matched {
+				nextKey := EventKey{
+					ResourceTypeCode:   ev.GetResource().GetTypeCode(),
+					ResourceExternalID: ev.GetResource().GetExternalId(),
+					StartTime:          ev.GetStartTime().AsTime(),
+					ID:                 ev.GetId(),
+				}
 				if h.Len() < boundedSize {
-					heap.Push(h, &heapItem{item: item})
+					heap.Push(h, nextKey)
 				} else {
-					if isNewer(item, (*h)[0].item) {
+					if compareEventKey(nextKey, (*h)[0]) > 0 {
 						heap.Pop(h)
-						heap.Push(h, &heapItem{item: item})
+						heap.Push(h, nextKey)
 					}
 				}
 			}
@@ -84,12 +84,10 @@ func (mq *MemTableQuery) Do(mts []*memTable) ([][]byte, bool, error) {
 	}
 
 	resultLen := h.Len()
-	keys := make([][]byte, resultLen)
+	keys := make([]EventKey, resultLen)
 
 	for i := resultLen - 1; i >= 0; i-- {
-		curr := heap.Pop(h).(*heapItem)
-		ev := curr.item.event
-		keys[i] = encodeKey(ev.StartTime.AsTime(), uuid.MustParse(ev.Id))
+		keys[i] = heap.Pop(h).(EventKey)
 	}
 
 	return keys, hasNext, nil

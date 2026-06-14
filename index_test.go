@@ -1,26 +1,18 @@
 package bitstar
 
 import (
-	"bytes"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
-	"go.etcd.io/bbolt"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func TestFromBbolt(t *testing.T) {
-	bucketName := []byte("events")
-
+func TestRoaringIndex(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 
 	id1, id2 := uuid.Must(uuid.NewV7()).String(), uuid.Must(uuid.NewV7()).String()
@@ -43,43 +35,18 @@ func TestFromBbolt(t *testing.T) {
 		},
 	}
 
-	db := db(t, bucketName, events)
-
-	err := db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketName)
-		i := 0
-		return b.ForEach(func(k, v []byte) error {
-			got := &storagepb.Event{}
-			if err := proto.Unmarshal(v, got); err != nil {
-				return err
-			}
-			want := events[len(events)-1-i]
-			if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
-				t.Fatalf("mismatch (-want +got):\n%s", diff)
-			}
-			i++
-			return nil
-		})
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	ri, err := fromBbolt(db, bucketName)
-	if err != nil {
-		t.Fatalf("index from bbolt fail: %v", err)
-	}
+	ri := riFromEvents(t, events)
 
 	if ri.all.GetCardinality() != 2 {
 		t.Errorf("expected 2 elements in all, got %d", ri.all.GetCardinality())
 	}
 
-	if startTime, id := decodeKey(ri.keys[0]); !startTime.Equal(startTime1) || id.String() != id1 {
-		t.Errorf("expected ri.keys[0] to be %q/%q, got %q/%q", startTime1, id1, startTime, id)
+	if !ri.keys[0].StartTime.Equal(startTime1) || ri.keys[0].ID != id1 {
+		t.Errorf("expected ri.keys[0] to be %q/%q, got %q/%q", startTime1, id1, ri.keys[0].StartTime, ri.keys[0].ID)
 	}
 
-	if startTime, id := decodeKey(ri.keys[1]); !startTime.Equal(startTime2) || id.String() != id2 {
-		t.Errorf("expected ri.keys[1] to be %q/%q, got %q/%q", startTime2, id2, startTime, id)
+	if !ri.keys[1].StartTime.Equal(startTime2) || ri.keys[1].ID != id2 {
+		t.Errorf("expected ri.keys[1] to be %q/%q, got %q/%q", startTime2, id2, ri.keys[1].StartTime, ri.keys[1].ID)
 	}
 
 	if !ri.tags["go"].Contains(0) || !ri.tags["go"].Contains(1) {
@@ -102,8 +69,6 @@ func TestFromBbolt(t *testing.T) {
 }
 
 func TestRoaringIndex_Filter(t *testing.T) {
-	bucketName := []byte("events")
-
 	now := time.Now().Truncate(time.Second)
 
 	events := []*storagepb.Event{
@@ -123,12 +88,7 @@ func TestRoaringIndex_Filter(t *testing.T) {
 		},
 	}
 
-	db := db(t, bucketName, events)
-
-	ri, err := fromBbolt(db, bucketName)
-	if err != nil {
-		t.Fatalf("index from bbolt fail: %v", err)
-	}
+	ri := riFromEvents(t, events)
 
 	tc := []struct {
 		startTime  time.Time
@@ -194,8 +154,10 @@ func TestRoaringIndex_Filter(t *testing.T) {
 
 			wantPosting := roaring.New()
 			for _, event := range tt.wantEvents {
-				key := encodeKey(event.StartTime.AsTime(), uuid.MustParse(event.GetId()))
-				wantPosting.Add(ri.indexes[string(key)])
+				wantPosting.Add(ri.indexes[EventKey{
+					StartTime: event.GetStartTime().AsTime(),
+					ID:        event.GetId(),
+				}])
 			}
 
 			if !wantPosting.Equals(posting) {
@@ -205,41 +167,7 @@ func TestRoaringIndex_Filter(t *testing.T) {
 	}
 }
 
-func db(t testing.TB, bucketName []byte, events []*storagepb.Event) *bbolt.DB {
-	t.Helper()
-	dir := t.TempDir()
-	db, err := bbolt.Open(filepath.Join(dir, "bbolt.db"), 0600, nil)
-	if err != nil {
-		t.Fatalf("bbolt open fail: %v", err)
-	}
-	err = db.Batch(func(tx *bbolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists(bucketName)
-		if err != nil {
-			return err
-		}
-		for _, event := range events {
-			key := encodeKey(
-				event.GetStartTime().AsTime(),
-				uuid.Must(uuid.Parse(event.GetId())),
-			)
-			val, err := proto.Marshal(event)
-			if err != nil {
-				return err
-			}
-			if err := b.Put(key, val); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("bbolt batch fail: %v", err)
-	}
-	return db
-}
-
 func TestMergeTwoIndices(t *testing.T) {
-	bucketName := []byte("events")
 	now := time.Now().Truncate(time.Second)
 
 	events0 := []*storagepb.Event{
@@ -269,17 +197,8 @@ func TestMergeTwoIndices(t *testing.T) {
 		},
 	}
 
-	db0 := db(t, bucketName, events0)
-	ri0, err := fromBbolt(db0, bucketName)
-	if err != nil {
-		t.Fatalf("failed to create ri0: %v", err)
-	}
-
-	db1 := db(t, bucketName, events1)
-	ri1, err := fromBbolt(db1, bucketName)
-	if err != nil {
-		t.Fatalf("failed to create ri1: %v", err)
-	}
+	ri0 := riFromEvents(t, events0)
+	ri1 := riFromEvents(t, events1)
 
 	merged := mergeTwoIndices(ri0, ri1)
 
@@ -288,7 +207,7 @@ func TestMergeTwoIndices(t *testing.T) {
 	}
 
 	for i := 0; i < len(merged.keys)-1; i++ {
-		if bytes.Compare(merged.keys[i], merged.keys[i+1]) <= 0 {
+		if compareEventKey(merged.keys[i], merged.keys[i+1]) <= 0 {
 			t.Errorf("sort order violation at index %d: key %x is not greater than %x", i, merged.keys[i], merged.keys[i+1])
 		}
 	}
@@ -317,4 +236,13 @@ func TestMergeTwoIndices(t *testing.T) {
 	if !ok || gotNewUnix != wantNewUnix {
 		t.Errorf("BSI value mismatch for rid=0: want %d, got %d (ok: %t)", wantNewUnix, gotNewUnix, ok)
 	}
+}
+
+func riFromEvents(t testing.TB, events []*storagepb.Event) *roaringIndex {
+	t.Helper()
+	ri := newRoaringIndex()
+	for _, event := range events {
+		indexEvent(ri, event)
+	}
+	return ri
 }

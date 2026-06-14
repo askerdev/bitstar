@@ -1,20 +1,30 @@
 package bitstar
 
 import (
-	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"path"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/askerdev/bitstar/bsi"
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"github.com/google/uuid"
+	"github.com/ydb-platform/ydb-go-sdk/v3"
+	"github.com/ydb-platform/ydb-go-sdk/v3/table"
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 )
+
+type EventKey struct {
+	ResourceTypeCode   string
+	ResourceExternalID string
+	StartTime          time.Time
+	ID                 string
+}
 
 type roaringIndex struct {
 	all         *roaring.Bitmap
@@ -23,8 +33,8 @@ type roaringIndex struct {
 	tags        map[string]*roaring.Bitmap
 	annotations map[Pair]*roaring.Bitmap
 
-	keys    [][]byte
-	indexes map[string]uint32
+	keys    []EventKey
+	indexes map[EventKey]uint32
 }
 
 func newRoaringIndex() *roaringIndex {
@@ -34,13 +44,13 @@ func newRoaringIndex() *roaringIndex {
 		endTime:     bsi.NewDefaultBSI(),
 		tags:        make(map[string]*roaring.Bitmap),
 		annotations: make(map[Pair]*roaring.Bitmap),
-		indexes:     make(map[string]uint32),
+		indexes:     make(map[EventKey]uint32),
 	}
 }
 
-func (ri *roaringIndex) nextMax(key []byte) (uint32, bool) {
-	idx, found := slices.BinarySearchFunc(ri.keys, key, func(target, key []byte) int {
-		return bytes.Compare(key, target)
+func (ri *roaringIndex) nextMax(key EventKey) (uint32, bool) {
+	idx, found := slices.BinarySearchFunc(ri.keys, key, func(target, key EventKey) int {
+		return compareEventKey(key, target)
 	})
 
 	if found {
@@ -197,6 +207,28 @@ func (ri *roaringIndex) evalRestriction(r *filtering.Restriction) (*roaring.Bitm
 	}
 }
 
+func fromYdb(ctx context.Context, db *ydb.Driver) (*roaringIndex, error) {
+	ri := newRoaringIndex()
+	query := fmt.Sprintf("SELECT %s FROM `%s`",
+		strings.Join(eventsCols, ","),
+		path.Join(db.Name(), "events"),
+	)
+	err := db.Table().Do(ctx, func(ctx context.Context, s table.Session) error {
+		res, err := s.StreamExecuteScanQuery(ctx, query, table.NewQueryParameters())
+		if err != nil {
+			return err
+		}
+		return forEachEvent(ctx, res, func(event *storagepb.Event) error {
+			indexEvent(ri, event)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ri, nil
+}
+
 func fromBbolt(db *bbolt.DB, bucket []byte) (*roaringIndex, error) {
 	ri := newRoaringIndex()
 
@@ -211,7 +243,7 @@ func fromBbolt(db *bbolt.DB, bucket []byte) (*roaringIndex, error) {
 				return err
 			}
 
-			indexEvent(ri, k, event)
+			indexEvent(ri, event)
 		}
 
 		return nil
@@ -245,8 +277,7 @@ func fromMemTable(mt *memTable) (*roaringIndex, error) {
 	})
 
 	for _, item := range mt.items {
-		k := encodeKey(item.event.StartTime.AsTime(), uuid.MustParse(item.event.Id))
-		indexEvent(ri, k, item.event)
+		indexEvent(ri, item.event)
 	}
 
 	return ri, nil
@@ -267,8 +298,8 @@ func mergeTwoIndices(a, b *roaringIndex) *roaringIndex {
 		endTime:     bsi.NewDefaultBSI(),
 		tags:        make(map[string]*roaring.Bitmap),
 		annotations: make(map[Pair]*roaring.Bitmap),
-		indexes:     make(map[string]uint32),
-		keys:        make([][]byte, 0, len(a.keys)+len(b.keys)),
+		indexes:     make(map[EventKey]uint32),
+		keys:        make([]EventKey, 0, len(a.keys)+len(b.keys)),
 	}
 
 	remapA := make([]uint32, len(a.keys))
@@ -276,8 +307,16 @@ func mergeTwoIndices(a, b *roaringIndex) *roaringIndex {
 
 	i, j := 0, 0
 	for i < len(a.keys) && j < len(b.keys) {
-		compare := bytes.Compare(a.keys[i], b.keys[j])
-		if compare >= 0 {
+		takeA := false
+
+		tCmp := a.keys[i].StartTime.Compare(b.keys[j].StartTime)
+		if tCmp != 0 {
+			takeA = tCmp < 0
+		} else {
+			takeA = a.keys[i].ID >= b.keys[j].ID
+		}
+
+		if takeA {
 			ri.keys = append(ri.keys, a.keys[i])
 			newRID := uint32(len(ri.keys) - 1)
 			remapA[i] = newRID
@@ -416,11 +455,17 @@ func mergeBSI(srcA, srcB *bsi.BSI, remapA, remapB []uint32, maxLen uint64) *bsi.
 	return dst
 }
 
-func indexEvent(ri *roaringIndex, key []byte, event *storagepb.Event) {
+func indexEvent(ri *roaringIndex, event *storagepb.Event) {
+	key := EventKey{
+		ResourceTypeCode:   event.GetResource().GetTypeCode(),
+		ResourceExternalID: event.GetResource().GetExternalId(),
+		StartTime:          event.GetStartTime().AsTime(),
+		ID:                 event.GetId(),
+	}
 	ri.keys = append(ri.keys, key)
 	index := uint32(len(ri.keys) - 1)
 	ri.all.Add(index)
-	ri.indexes[string(key)] = index
+	ri.indexes[key] = index
 
 	ri.startTime.SetValue(uint64(index), event.StartTime.AsTime().Unix())
 	ri.endTime.SetValue(uint64(index), event.EndTime.AsTime().Unix())

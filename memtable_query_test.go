@@ -1,7 +1,6 @@
 package bitstar
 
 import (
-	"encoding/base64"
 	"fmt"
 	"testing"
 	"time"
@@ -119,7 +118,7 @@ func TestMemTableQuery_Do(t *testing.T) {
 			}
 
 			for hasNext {
-				tt.q.PageToken = base64.StdEncoding.EncodeToString(keys[len(keys)-1])
+				tt.q.PageToken, _ = EncodePageToken(keys[len(keys)-1])
 				nextKeys, localHasNext, err := tt.q.Do(mts)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -130,9 +129,8 @@ func TestMemTableQuery_Do(t *testing.T) {
 
 			gotKeysPretty := make([]string, 0, len(keys))
 			for _, key := range keys {
-				startTime, id := decodeKey(key)
 				gotKeysPretty = append(gotKeysPretty,
-					fmt.Sprintf("%q/%q", startTime.UTC(), id),
+					fmt.Sprintf("%q/%q", key.StartTime.UTC(), key.ID),
 				)
 			}
 
@@ -141,7 +139,7 @@ func TestMemTableQuery_Do(t *testing.T) {
 				wantKeysPretty = append(wantKeysPretty,
 					fmt.Sprintf("%q/%q",
 						tt.want[i].GetStartTime().AsTime(),
-						uuid.MustParse(tt.want[i].GetId()),
+						tt.want[i].GetId(),
 					),
 				)
 			}

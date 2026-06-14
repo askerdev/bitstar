@@ -19,23 +19,36 @@ message Event {
 
   string description = 3;
 
-  google.protobuf.Timestamp start_time = 4;
+  Resource resource = 4;
 
-  google.protobuf.Timestamp end_time = 5;
+  google.protobuf.Timestamp start_time = 5;
 
-  repeated string tags = 6;
+  google.protobuf.Timestamp end_time = 6;
 
-  map<string, string> annotations = 7;
+  repeated string tags = 7;
 
-  string created_by = 8;
+  map<string, string> annotations = 8;
 
-  string updated_by = 9;
+  string created_by = 9;
 
-  google.protobuf.Timestamp create_time = 10;
+  string updated_by = 10;
 
-  google.protobuf.Timestamp update_time = 11;
+  google.protobuf.Timestamp create_time = 11;
 
-  google.protobuf.Timestamp delete_time = 12;
+  google.protobuf.Timestamp update_time = 12;
+
+  google.protobuf.Timestamp delete_time = 13;
+}
+
+message Resource {
+  string type_code = 1;
+  string external_id = 2;
+}
+
+message EventKey {
+  Resource resource = 1;
+  google.protobuf.Timestamp start_time = 2;
+  string id = 3;
 }
 
 message CreateEventRequest {

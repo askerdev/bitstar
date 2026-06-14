@@ -1,7 +1,6 @@
 package bitstar
 
 import (
-	"encoding/base64"
 	"fmt"
 	"testing"
 	"time"
@@ -14,8 +13,6 @@ import (
 )
 
 func TestIndexQuery_Do(t *testing.T) {
-	bucketName := []byte("events")
-
 	now := time.Now().Truncate(time.Second)
 	uuidMax := "ffffffff-ffff-ffff-ffff-ffffffffffff"
 	uuidMin := "00000000-0000-0000-0000-000000000000"
@@ -73,12 +70,7 @@ func TestIndexQuery_Do(t *testing.T) {
 
 	ris := make([]*roaringIndex, 0, len(events))
 	for _, events := range events {
-		db := db(t, bucketName, events)
-		ri, err := fromBbolt(db, bucketName)
-		if err != nil {
-			t.Fatalf("index from bbolt fail: %v", err)
-		}
-		ris = append(ris, ri)
+		ris = append(ris, riFromEvents(t, events))
 	}
 
 	tc := []struct {
@@ -123,7 +115,7 @@ func TestIndexQuery_Do(t *testing.T) {
 			}
 
 			for hasNext {
-				tt.q.PageToken = base64.StdEncoding.EncodeToString(keys[len(keys)-1])
+				tt.q.PageToken, _ = EncodePageToken(keys[len(keys)-1])
 				nextKeys, localHasNext, err := tt.q.Do(ris)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -134,9 +126,8 @@ func TestIndexQuery_Do(t *testing.T) {
 
 			gotKeysPretty := make([]string, 0, len(keys))
 			for _, key := range keys {
-				startTime, id := decodeKey(key)
 				gotKeysPretty = append(gotKeysPretty,
-					fmt.Sprintf("%q/%q", startTime.UTC(), id),
+					fmt.Sprintf("%q/%q", key.StartTime.UTC(), key.ID),
 				)
 			}
 
@@ -145,7 +136,7 @@ func TestIndexQuery_Do(t *testing.T) {
 				wantKeysPretty = append(wantKeysPretty,
 					fmt.Sprintf("%q/%q",
 						tt.want[i].GetStartTime().AsTime(),
-						uuid.MustParse(tt.want[i].GetId()),
+						tt.want[i].GetId(),
 					),
 				)
 			}

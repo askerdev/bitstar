@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -51,7 +50,7 @@ type Event struct {
 	ResourceManagerEntity ResourceManagerEntity `yson:"services.resource_manager_entity"`
 }
 
-var NullEndTime = time.Unix(int64(uint64(math.MaxUint32)), 0)
+var NullEndTime = time.Date(2105, time.December, 31, 23, 59, 59, 0, time.UTC)
 
 type Resource struct {
 	TypeCode   string `json:"type_code"`
@@ -153,7 +152,11 @@ func main() {
 			Event: &storagepb.Event{
 				Title:       strptr(event.Title),
 				Description: strptr(event.Description),
-				StartTime:   timestamppb.New(time.Unix(int64(*event.StartTime), 0)),
+				Resource: &storagepb.Resource{
+					TypeCode:   resourceTypeCode(event.ResourceManagerEntity.Type),
+					ExternalId: event.ResourceManagerEntity.Slug,
+				},
+				StartTime: timestamppb.New(time.Unix(int64(*event.StartTime), 0)),
 				Annotations: map[string]string{
 					"resource_type_code":   resourceTypeCode(event.ResourceManagerEntity.Type),
 					"resource_external_id": event.ResourceManagerEntity.Slug,
