@@ -4,18 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/askerdev/bitstar/bsi"
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"github.com/ydb-platform/ydb-go-sdk/v3"
-	"github.com/ydb-platform/ydb-go-sdk/v3/table"
-	"go.etcd.io/bbolt"
+	"go.ytsaurus.tech/yt/go/yt"
+	"go.ytsaurus.tech/yt/go/ypath"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -207,52 +204,33 @@ func (ri *roaringIndex) evalRestriction(r *filtering.Restriction) (*roaring.Bitm
 	}
 }
 
-func fromYdb(ctx context.Context, db *ydb.Driver) (*roaringIndex, error) {
-	ri := newRoaringIndex()
-	query := fmt.Sprintf("SELECT %s FROM `%s`",
-		strings.Join(eventsCols, ","),
-		path.Join(db.Name(), "events"),
-	)
-	err := db.Table().Do(ctx, func(ctx context.Context, s table.Session) error {
-		res, err := s.StreamExecuteScanQuery(ctx, query, table.NewQueryParameters())
-		if err != nil {
-			return err
-		}
-		return forEachEvent(ctx, res, func(event *storagepb.Event) error {
-			indexEvent(ri, event)
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	return ri, nil
-}
-
-func fromBbolt(db *bbolt.DB, bucket []byte) (*roaringIndex, error) {
+// fromYt loads all events from tablePath into a roaringIndex.
+// Rows are returned by ReadTable in primary key order
+// (resource_type_code, resource_external_id, start_time, id).
+func fromYt(ctx context.Context, ytc yt.Client, tablePath string) (*roaringIndex, error) {
 	ri := newRoaringIndex()
 
-	err := db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(bucket)
+	r, err := ytc.ReadTable(ctx, ypath.Path(tablePath), nil)
+	if err != nil {
+		return nil, fmt.Errorf("read table: %w", err)
+	}
+	defer r.Close()
 
-		c := bucket.Cursor()
-
-		for k, v := c.Last(); k != nil; k, v = c.Prev() {
-			event := &storagepb.Event{}
-			if err := proto.Unmarshal(v, event); err != nil {
-				return err
-			}
-
-			indexEvent(ri, event)
+	for r.Next() {
+		var row EventRow
+		if err := r.Scan(&row); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
 		}
 
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		event := &storagepb.Event{}
+		if err := proto.Unmarshal(row.Event, event); err != nil {
+			return nil, fmt.Errorf("unmarshal proto: %w", err)
+		}
+
+		indexEvent(ri, event)
 	}
 
-	return ri, nil
+	return ri, r.Err()
 }
 
 func fromMemTable(mt *memTable) (*roaringIndex, error) {

@@ -2,22 +2,20 @@ package bitstar
 
 import (
 	"context"
-	"encoding/json"
-	"path"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
+	"github.com/askerdev/bitstar/ytclient"
 	"github.com/google/uuid"
-	"github.com/ydb-platform/ydb-go-sdk/v3"
-	"github.com/ydb-platform/ydb-go-sdk/v3/table"
-	"github.com/ydb-platform/ydb-go-sdk/v3/table/options"
-	"github.com/ydb-platform/ydb-go-sdk/v3/table/types"
+	"go.ytsaurus.tech/yt/go/wire"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -52,20 +50,29 @@ type Storage struct {
 	compactDoneCh chan *roaringIndex
 	levels        atomic.Pointer[[4]*roaringIndex]
 
-	db      *ydb.Driver
+	timestamp atomic.Uint64
+
+	yt      *ytclient.Client
 	writeCh chan writeRequest
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 }
 
-func Open(ctx context.Context, db *ydb.Driver) (*Storage, error) {
-	ri, err := fromYdb(ctx, db)
+const eventsTable = "//tmp/khuzhokov/events"
+
+func Open(ctx context.Context, yt *ytclient.Client) (*Storage, error) {
+	ytc, err := yt.NewHTTPClient()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create http client: %w", err)
+	}
+
+	ri, err := fromYt(ctx, ytc, eventsTable)
+	if err != nil {
+		return nil, fmt.Errorf("load index from yt: %w", err)
 	}
 
 	s := &Storage{
-		db:            db,
+		yt:            yt,
 		writeCh:       make(chan writeRequest),
 		stopCh:        make(chan struct{}, 2),
 		compactCh:     make(chan struct{}),
@@ -74,8 +81,15 @@ func Open(ctx context.Context, db *ydb.Driver) (*Storage, error) {
 
 	s.cur.Store(newMemTable())
 	s.pen.Store(&[]*roaringIndex{})
+	s.levels.Store(&[4]*roaringIndex{ri, nil, nil, nil})
 
-	s.levels.Store(&[4]*roaringIndex{nil, nil, nil, ri})
+	ts, err := yt.GenerateTimestamp(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("generate initial timestamp: %w", err)
+	}
+	s.timestamp.Store(ts)
+
+	fmt.Println("starting from timestamp", ts)
 
 	s.wg.Go(func() {
 		s.flushWorker(30 * time.Second)
@@ -205,47 +219,47 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 
 	events := make([]*storagepb.Event, 0, len(in.GetRequests()))
 	batch := make([]*writeItem, 0, len(in.GetRequests()))
-	rows := make([]types.Value, 0, len(in.GetRequests()))
+	rows := make([]any, 0, len(in.GetRequests()))
 
 	for _, req := range in.GetRequests() {
 		id := uuid.Must(uuid.NewV7())
 		event := req.GetEvent()
 		event.Id = id.String()
 
-		tags, _ := json.Marshal(event.Tags)
-		annotations, _ := json.Marshal(event.Annotations)
+		eventBytes, err := proto.Marshal(event)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "write fail: %v", err)
+		}
 
 		rows = append(rows,
-			types.StructValue(
-				types.StructFieldValue("resource_type_code", types.UTF8Value(event.GetResource().GetTypeCode())),
-				types.StructFieldValue("resource_external_id", types.UTF8Value(event.GetResource().GetExternalId())),
-				types.StructFieldValue("start_time", types.TimestampValueFromTime(event.GetStartTime().AsTime())),
-				types.StructFieldValue("id", types.UuidValue(id)),
-				types.StructFieldValue("title", types.UTF8Value(event.GetTitle())),
-				types.StructFieldValue("description", types.UTF8Value(event.GetDescription())),
-				types.StructFieldValue("end_time", types.TimestampValueFromTime(event.GetEndTime().AsTime())),
-				types.StructFieldValue("tags", types.JSONValueFromBytes(tags)),
-				types.StructFieldValue("annotations", types.JSONValueFromBytes(annotations)),
-				types.StructFieldValue("created_by", types.BytesValue([]byte(event.GetCreatedBy()))),
-				types.StructFieldValue("updated_by", types.BytesValue([]byte(event.GetUpdatedBy()))),
-				types.StructFieldValue("create_time", types.TimestampValueFromTime(event.GetCreateTime().AsTime())),
-				types.StructFieldValue("update_time", types.TimestampValueFromTime(event.GetUpdateTime().AsTime())),
-			),
+			EventRow{
+				ResourceTypeCode:   event.GetResource().GetTypeCode(),
+				ResourceExternalID: event.GetResource().GetExternalId(),
+				StartTime:          uint64(event.GetStartTime().AsTime().UnixMicro()),
+				ID:                 id.String(),
+				Event:              eventBytes,
+			},
 		)
 
+		events = append(events, event)
 		batch = append(batch, &writeItem{item: newMemTableItem(event)})
 	}
 
-	err := s.db.Table().
-		BulkUpsert(
-			ctx,
-			path.Join(s.db.Name(), "events"),
-			table.BulkUpsertDataRows(types.ListValue(rows...)),
-			table.WithIdempotent(),
-		)
+	tx, err := s.yt.StartTabletTx(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "write fail: %v", err)
+		return nil, status.Errorf(codes.Internal, "start tx fail: %v", err)
 	}
+
+	if err := s.yt.InsertRows(ctx, tx, eventsTable, rows); err != nil {
+		_ = s.yt.AbortTabletTx(ctx, tx)
+		return nil, status.Errorf(codes.Internal, "insert fail: %v", err)
+	}
+
+	ts, err := s.yt.CommitTabletTx(ctx, tx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "commit fail: %v", err)
+	}
+	s.timestamp.Store(ts)
 
 	select {
 	case s.writeCh <- writeRequest{in: batch, rsp: resCh}:
@@ -254,10 +268,7 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 	}
 
 	select {
-	case res := <-resCh:
-		if res.err != nil {
-			return nil, status.Errorf(codes.Internal, "write fail: %v", res.err)
-		}
+	case <-resCh:
 		return &storagepb.BatchCreateEventsResponse{Events: events}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -307,6 +318,7 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 		return nil, err
 	}
 
+	ts := s.timestamp.Load()
 	snapshotCur := s.cur.Load()
 	snapshotPen := s.pen.Load()
 	snapshotLevels := s.levels.Load()
@@ -396,37 +408,35 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 		return &storagepb.ListEventsResponse{Stats: stats}, nil
 	}
 
-	tableKeys := make([]types.Value, 0, len(keys))
+	tableKeys := make([]any, 0, len(keys))
 	for _, key := range keys {
-		tableKeys = append(tableKeys, types.StructValue(
-			types.StructFieldValue("resource_type_code", types.UTF8Value(key.ResourceTypeCode)),
-			types.StructFieldValue("resource_external_id", types.UTF8Value(key.ResourceExternalID)),
-			types.StructFieldValue("start_time", types.TimestampValueFromTime(key.StartTime)),
-			types.StructFieldValue("id", types.UuidValue(uuid.MustParse(key.ID))),
-		))
+		tableKeys = append(tableKeys, EventRowKey{
+			ResourceTypeCode:   key.ResourceTypeCode,
+			ResourceExternalID: key.ResourceExternalID,
+			StartTime:          uint64(key.StartTime.UnixMicro()),
+			ID:                 key.ID,
+		})
 	}
 
-	opts := []options.ReadRowsOption{options.ReadColumns(eventsCols...)}
-
-	result, err := s.db.Table().
-		ReadRows(
-			ctx,
-			path.Join(s.db.Name(), "events"),
-			types.ListValue(tableKeys...),
-			opts,
-			table.WithIdempotent(),
-		)
+	wireRows, nameTable, err := s.yt.LookupRows(ctx, eventsTable, tableKeys, ts)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list fail: %v", err)
+		return nil, status.Errorf(codes.Internal, "lookup fail: %v", err)
 	}
 
 	eventsMap := make(map[string]*storagepb.Event, len(keys))
-	err = forEachEvent(ctx, result, func(event *storagepb.Event) error {
-		eventsMap[event.Id] = event
-		return nil
-	})
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "scan fail: %v", err)
+	dec := wire.NewDecoder(nameTable, nil)
+	for _, r := range wireRows {
+		var row EventRow
+		if err := dec.UnmarshalRow(r, &row); err != nil {
+			return nil, status.Errorf(codes.Internal, "row unmarshal fail: %v", err)
+		}
+
+		event := &storagepb.Event{}
+		if err := proto.Unmarshal(row.Event, event); err != nil {
+			return nil, status.Errorf(codes.Internal, "proto unmarshal fail: %v", err)
+		}
+
+		eventsMap[event.GetId()] = event
 	}
 
 	events := make([]*storagepb.Event, 0, len(keys))

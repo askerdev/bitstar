@@ -6,10 +6,11 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 
 	"github.com/askerdev/bitstar"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"github.com/ydb-platform/ydb-go-sdk/v3"
+	"github.com/askerdev/bitstar/ytclient"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -34,13 +35,15 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	db, err := ydb.Open(ctx, "grpc://localhost:2136/local")
-	if err != nil {
-		panic(err)
+	host := os.Getenv("YT_HOST")
+	if host == "" {
+		log.Fatal("YT_HOST env var is required")
 	}
-	defer db.Close(ctx)
 
-	storage, err := bitstar.Open(ctx, db)
+	yt := ytclient.NewClient(ctx, host)
+	defer yt.Close()
+
+	storage, err := bitstar.Open(ctx, yt)
 	if err != nil {
 		panic(err)
 	}
