@@ -50,15 +50,16 @@ type Storage struct {
 	compactDoneCh chan *roaringIndex
 	levels        atomic.Pointer[[4]*roaringIndex]
 
-	timestamp atomic.Uint64
-
 	yt      *ytclient.Client
 	writeCh chan writeRequest
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 }
 
-const eventsTable = "//tmp/khuzhokov/events"
+const (
+	eventsTable            = "//home/events"
+	eventsIdUniqIndexTable = "//home/events_id_uniq_idx"
+)
 
 func Open(ctx context.Context, yt *ytclient.Client) (*Storage, error) {
 	ytc, err := yt.NewHTTPClient()
@@ -87,7 +88,6 @@ func Open(ctx context.Context, yt *ytclient.Client) (*Storage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("generate initial timestamp: %w", err)
 	}
-	s.timestamp.Store(ts)
 
 	fmt.Println("starting from timestamp", ts)
 
@@ -218,13 +218,22 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 	resCh := make(chan writeResponse, 1)
 
 	events := make([]*storagepb.Event, 0, len(in.GetRequests()))
-	batch := make([]*writeItem, 0, len(in.GetRequests()))
 	rows := make([]any, 0, len(in.GetRequests()))
+	keys := make([]any, 0, len(in.GetRequests()))
 
 	for _, req := range in.GetRequests() {
 		id := uuid.Must(uuid.NewV7())
 		event := req.GetEvent()
 		event.Id = id.String()
+
+		keys = append(keys,
+			EventRowKey{
+				ResourceTypeCode:   event.GetResource().GetTypeCode(),
+				ResourceExternalID: event.GetResource().GetExternalId(),
+				StartTime:          uint64(event.GetStartTime().AsTime().UnixMicro()),
+				ID:                 id.String(),
+			},
+		)
 
 		eventBytes, err := proto.Marshal(event)
 		if err != nil {
@@ -242,12 +251,16 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 		)
 
 		events = append(events, event)
-		batch = append(batch, &writeItem{item: newMemTableItem(event)})
 	}
 
 	tx, err := s.yt.StartTabletTx(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "start tx fail: %v", err)
+	}
+
+	if err := s.yt.InsertRows(ctx, tx, eventsIdUniqIndexTable, keys); err != nil {
+		_ = s.yt.AbortTabletTx(ctx, tx)
+		return nil, status.Errorf(codes.Internal, "insert fail: %v", err)
 	}
 
 	if err := s.yt.InsertRows(ctx, tx, eventsTable, rows); err != nil {
@@ -259,7 +272,11 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "commit fail: %v", err)
 	}
-	s.timestamp.Store(ts)
+
+	batch := make([]*writeItem, 0, len(in.GetRequests()))
+	for _, event := range events {
+		batch = append(batch, &writeItem{item: newMemTableItem(event, ts)})
+	}
 
 	select {
 	case s.writeCh <- writeRequest{in: batch, rsp: resCh}:
@@ -318,7 +335,11 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 		return nil, err
 	}
 
-	ts := s.timestamp.Load()
+	ts, err := s.yt.GenerateTimestamp(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list fail: %v", err)
+	}
+
 	snapshotCur := s.cur.Load()
 	snapshotPen := s.pen.Load()
 	snapshotLevels := s.levels.Load()

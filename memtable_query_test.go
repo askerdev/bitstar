@@ -71,7 +71,7 @@ func TestMemTableQuery_Do(t *testing.T) {
 	for _, events := range events {
 		mt := newMemTable()
 		for _, event := range events {
-			mt.put(event)
+			mt.put(event, 0)
 		}
 		mts = append(mts, mt)
 	}

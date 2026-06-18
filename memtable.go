@@ -11,13 +11,15 @@ type memTableItem struct {
 	event       *storagepb.Event
 	tags        *bloom.BloomFilter
 	annotations *bloom.BloomFilter
+	ts          uint64
 }
 
-func newMemTableItem(event *storagepb.Event) *memTableItem {
+func newMemTableItem(event *storagepb.Event, ts uint64) *memTableItem {
 	item := &memTableItem{
 		event:       event,
 		tags:        bloom.NewWithEstimates(50, 0.01),
 		annotations: bloom.NewWithEstimates(50, 0.01),
+		ts:          ts,
 	}
 	for _, tag := range event.Tags {
 		item.tags.AddString(tag)
@@ -47,7 +49,7 @@ func (mt *memTable) putItem(mti *memTableItem) {
 	mt.count++
 }
 
-func (mt *memTable) put(event *storagepb.Event) {
-	mt.items = append(mt.items, newMemTableItem(event))
+func (mt *memTable) put(event *storagepb.Event, ts uint64) {
+	mt.items = append(mt.items, newMemTableItem(event, ts))
 	mt.count++
 }

@@ -208,7 +208,7 @@ func TestMergeTwoIndices(t *testing.T) {
 
 	for i := 0; i < len(merged.keys)-1; i++ {
 		if compareEventKey(merged.keys[i], merged.keys[i+1]) <= 0 {
-			t.Errorf("sort order violation at index %d: key %x is not greater than %x", i, merged.keys[i], merged.keys[i+1])
+			t.Errorf("sort order violation at index %d: key %v is not greater than %v", i, merged.keys[i], merged.keys[i+1])
 		}
 	}
 
