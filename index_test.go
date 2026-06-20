@@ -242,7 +242,7 @@ func riFromEvents(t testing.TB, events []*storagepb.Event) *roaringIndex {
 	t.Helper()
 	ri := newRoaringIndex()
 	for _, event := range events {
-		indexEvent(ri, event)
+		indexEvent(ri, event, 0, false)
 	}
 	return ri
 }

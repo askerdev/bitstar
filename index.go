@@ -11,8 +11,8 @@ import (
 	"github.com/askerdev/bitstar/bsi"
 	"github.com/askerdev/bitstar/filtering"
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"go.ytsaurus.tech/yt/go/yt"
 	"go.ytsaurus.tech/yt/go/ypath"
+	"go.ytsaurus.tech/yt/go/yt"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -21,6 +21,19 @@ type EventKey struct {
 	ResourceExternalID string
 	StartTime          time.Time
 	ID                 string
+	Timestamp          uint64
+	IsDeleted          bool
+}
+
+func EventKeyFromProto(event *storagepb.Event, ts uint64, isDeleted bool) EventKey {
+	return EventKey{
+		ResourceTypeCode:   event.GetResource().GetTypeCode(),
+		ResourceExternalID: event.GetResource().GetExternalId(),
+		StartTime:          event.GetStartTime().AsTime(),
+		ID:                 event.GetId(),
+		Timestamp:          ts,
+		IsDeleted:          isDeleted,
+	}
 }
 
 type roaringIndex struct {
@@ -227,38 +240,47 @@ func fromYt(ctx context.Context, ytc yt.Client, tablePath string) (*roaringIndex
 			return nil, fmt.Errorf("unmarshal proto: %w", err)
 		}
 
-		indexEvent(ri, event)
+		indexEvent(ri, event, 0, false)
 	}
 
 	return ri, r.Err()
 }
 
-func fromMemTable(mt *memTable) (*roaringIndex, error) {
+func fromMemTable(mt *memTable) *roaringIndex {
 	ri := newRoaringIndex()
 
-	slices.SortFunc(mt.items, func(a, b *memTableItem) int {
-		timeA := a.event.StartTime.AsTime()
-		timeB := b.event.StartTime.AsTime()
-		if timeA.After(timeB) {
-			return -1
-		}
-		if timeA.Before(timeB) {
-			return 1
-		}
-		if b.event.Id > a.event.Id {
-			return 1
-		}
-		if b.event.Id < a.event.Id {
-			return -1
-		}
-		return 0
-	})
+	// slices.SortFunc(mt.items, func(a, b *memTableItem) int {
+	// 	timeA := a.event.StartTime.AsTime()
+	// 	timeB := b.event.StartTime.AsTime()
+	// 	if timeA.After(timeB) {
+	// 		return -1
+	// 	}
+	// 	if timeA.Before(timeB) {
+	// 		return 1
+	// 	}
+	// 	if b.event.Id > a.event.Id {
+	// 		return 1
+	// 	}
+	// 	if b.event.Id < a.event.Id {
+	// 		return -1
+	// 	}
+	// 	if a.ts < b.ts {
+	// 		return -1
+	// 	}
+	// 	if a.ts > b.ts {
+	// 		return 1
+	// 	}
+	// 	return 0
+	// })
 
-	for _, item := range mt.items {
-		indexEvent(ri, item.event)
-	}
+	// for i, item := range mt.items {
+	// 	if i < len(mt.items)-1 && item.event.Id == mt.items[i+1].event.Id {
+	// 		continue
+	// 	}
+	// 	indexEvent(ri, item.event, item.ts, item.isDeleted)
+	// }
 
-	return ri, nil
+	return ri
 }
 
 func mergeTwoIndices(a, b *roaringIndex) *roaringIndex {
@@ -431,12 +453,14 @@ func mergeBSI(srcA, srcB *bsi.BSI, remapA, remapB []uint32, maxLen uint64) *bsi.
 	return dst
 }
 
-func indexEvent(ri *roaringIndex, event *storagepb.Event) {
+func indexEvent(ri *roaringIndex, event *storagepb.Event, ts uint64, isDeleted bool) {
 	key := EventKey{
 		ResourceTypeCode:   event.GetResource().GetTypeCode(),
 		ResourceExternalID: event.GetResource().GetExternalId(),
-		StartTime:          event.GetStartTime().AsTime(),
+		StartTime:          event.GetStartTime().AsTime().Local(),
 		ID:                 event.GetId(),
+		Timestamp:          ts,
+		IsDeleted:          isDeleted,
 	}
 	ri.keys = append(ri.keys, key)
 	index := uint32(len(ri.keys) - 1)

@@ -12,7 +12,6 @@ import (
 	"github.com/askerdev/bitstar/ytclient"
 	"github.com/google/uuid"
 	"go.ytsaurus.tech/yt/go/wire"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -31,6 +30,7 @@ var (
 )
 
 type writeItem struct {
+	key  EventKey
 	item *memTableItem
 }
 
@@ -275,7 +275,10 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 
 	batch := make([]*writeItem, 0, len(in.GetRequests()))
 	for _, event := range events {
-		batch = append(batch, &writeItem{item: newMemTableItem(event, ts)})
+		batch = append(batch, &writeItem{
+			key:  EventKeyFromProto(event, ts, false),
+			item: newMemTableItem(event, ts, false),
+		})
 	}
 
 	select {
@@ -303,7 +306,7 @@ func (s *Storage) batchCreateEvents(in []*writeItem) error {
 		s.cur.Store(newTable)
 
 		curTable.wg.Wait()
-		ri, _ := fromMemTable(curTable)
+		ri := fromMemTable(curTable)
 
 		oldSlice := *s.pen.Load()
 		newSlice := make([]*roaringIndex, len(oldSlice)+1)
@@ -321,7 +324,7 @@ func (s *Storage) batchCreateEvents(in []*writeItem) error {
 	}
 
 	for _, wi := range in {
-		curTable.putItem(wi.item)
+		curTable.putItem(wi.key, wi.item)
 	}
 
 	curTable.wg.Done()
@@ -345,7 +348,6 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 	snapshotLevels := s.levels.Load()
 
 	stats := &storagepb.Stats{
-		CurrentMemTableSize:       int32(snapshotCur.count),
 		PendingIndexCount:         int32(len(*snapshotPen)),
 		PendingIndexCardinalities: make(map[int32]int32),
 		LevelCardinalities:        make(map[int32]int32),
@@ -367,66 +369,41 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 		}
 	}
 
-	eg := &errgroup.Group{}
+	iterators := []Iterator{NewMemTableIterator(snapshotCur, filter, ts)}
 
-	var scanKeys []EventKey
-	var hasScanNext bool
+	ris := make([]*roaringIndex, 0, len(snapshotLevels)+len(*snapshotPen))
+	ris = append(ris, (*snapshotLevels)[:]...)
+	ris = append(ris, *snapshotPen...)
 
-	eg.Go(func() error {
-		sq := MemTableQuery{
-			PageToken: in.GetPageToken(),
-			PageSize:  int(in.GetPageSize()),
-			StartTime: in.GetStartTime().AsTime(),
-			EndTime:   in.GetEndTime().AsTime(),
-			Filter:    filter,
-		}
-
-		keys, hasNext, err := sq.Do([]*memTable{snapshotCur})
+	startTime := in.GetStartTime().AsTime()
+	endTime := in.GetEndTime().AsTime()
+	for _, ri := range ris {
+		posting, err := ri.query(startTime, endTime, filter)
 		if err != nil {
-			return err
+			return nil, status.Errorf(codes.Internal, "list fail: %v", err)
 		}
-
-		scanKeys = keys
-		hasScanNext = hasNext
-
-		return nil
-	})
-
-	var indexKeys []EventKey
-	var hasIndexNext bool
-
-	eg.Go(func() error {
-		iq := IndexQuery{
-			PageToken: in.GetPageToken(),
-			PageSize:  int(in.GetPageSize()),
-			StartTime: in.GetStartTime().AsTime(),
-			EndTime:   in.GetEndTime().AsTime(),
-			Filter:    filter,
-		}
-
-		levels := *snapshotLevels
-		ris := make([]*roaringIndex, 0, len(levels)+len(*snapshotPen))
-		ris = append(ris, (*snapshotLevels)[:]...)
-		ris = append(ris, *snapshotPen...)
-
-		keys, hasNext, err := iq.Do(ris)
-		if err != nil {
-			return err
-		}
-
-		indexKeys = keys
-		hasIndexNext = hasNext
-
-		return nil
-	})
-
-	if err := eg.Wait(); err != nil {
-		return nil, status.Errorf(codes.Internal, "list fail: %v", err)
+		iterators = append(iterators, NewIndexIterator(ri, posting, ts))
 	}
 
-	keys := mergeKeysLimited(scanKeys, indexKeys, int(in.GetPageSize()))
+	iter := NewMergeIterator(iterators)
+
+	pageSize := int(in.GetPageSize() + 1)
+	keys := make([]EventKey, 0, pageSize)
+	for i := 0; i < pageSize && iter.Next(); i++ {
+		keys = append(keys, iter.Value())
+	}
 	if len(keys) == 0 {
 		return &storagepb.ListEventsResponse{Stats: stats}, nil
+	}
+
+	var nextPageToken string
+	if len(keys) == pageSize {
+		var err error
+		nextPageToken, err = EncodePageToken(keys[len(keys)-1])
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "list fail: %v", err)
+		}
+		keys = keys[:len(keys)-1]
 	}
 
 	tableKeys := make([]any, 0, len(keys))
@@ -464,15 +441,6 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 	for _, key := range keys {
 		if ev, ok := eventsMap[key.ID]; ok {
 			events = append(events, ev)
-		}
-	}
-
-	var nextPageToken string
-	if hasScanNext || hasIndexNext {
-		var err error
-		nextPageToken, err = EncodePageToken(keys[len(keys)-1])
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "list fail: %v", err)
 		}
 	}
 

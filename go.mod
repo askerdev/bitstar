@@ -5,8 +5,8 @@ go 1.25.0
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.18.2
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
-	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
+	github.com/huandu/skiplist v1.2.1
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/zap v1.28.0
 	go.ytsaurus.tech/library/go/ptr v0.0.2
