@@ -446,7 +446,140 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 }
 
 func (s *Storage) UpdateEvent(ctx context.Context, in *storagepb.UpdateEventRequest) (*storagepb.UpdateEventResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
+	id := in.GetEvent().GetId()
+
+	tx, ts, err := s.yt.StartTabletTx(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "start tx fail: %v", err)
+	}
+
+	wireRows, nameTable, err := s.yt.LookupRows(ctx, eventsIdUniqIndexTable, []any{EventIndexRowKey{ID: id}}, ts)
+	if err != nil || len(wireRows) != 1 {
+		return nil, status.Errorf(codes.Internal, "lookup fail: %v", err)
+	}
+
+	dec := wire.NewDecoder(nameTable, nil)
+	var key EventRowKey
+	if err := dec.UnmarshalRow(wireRows[0], &key); err != nil {
+		return nil, status.Errorf(codes.Internal, "row unmarshal fail: %v", err)
+	}
+
+	wireRows, nameTable, err = s.yt.LookupRows(ctx, eventsTable, []any{key}, ts)
+	if err != nil || len(wireRows) != 1 {
+		return nil, status.Errorf(codes.Internal, "lookup fail: %v", err)
+	}
+
+	dec = wire.NewDecoder(nameTable, nil)
+	var row EventRow
+	if err := dec.UnmarshalRow(wireRows[0], &row); err != nil {
+		return nil, status.Errorf(codes.Internal, "row unmarshal fail: %v", err)
+	}
+
+	event := &storagepb.Event{}
+	if err := proto.Unmarshal(row.Event, event); err != nil {
+		return nil, status.Errorf(codes.Internal, "proto unmarshal fail: %v", err)
+	}
+
+	paths := in.GetUpdateMask().GetPaths()
+	var keyChanged bool
+	for _, path := range paths {
+		switch path {
+		case "title":
+			event.Title = in.GetEvent().GetTitle()
+		case "description":
+			event.Description = in.GetEvent().GetDescription()
+		case "start_time":
+			keyChanged = true
+			event.StartTime = in.GetEvent().GetStartTime()
+		case "end_time":
+			event.EndTime = in.GetEvent().GetEndTime()
+		case "tags":
+			event.Tags = in.GetEvent().GetTags()
+		case "annotations":
+			event.Annotations = in.GetEvent().GetAnnotations()
+		}
+	}
+
+	if keyChanged {
+		if err := s.yt.DeleteRows(ctx, tx, eventsTable, []any{key}); err != nil {
+			return nil, status.Errorf(codes.Internal, "delete event fail: %v", err)
+		}
+	}
+
+	bytes, err := proto.Marshal(event)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "proto marshal fail: %v", err)
+	}
+
+	newEvent := EventRow{
+		ResourceTypeCode:   event.GetResource().GetTypeCode(),
+		ResourceExternalID: event.GetResource().GetExternalId(),
+		StartTime:          uint64(event.GetStartTime().AsTime().UnixMicro()),
+		ID:                 event.GetId(),
+		Event:              bytes,
+	}
+
+	if err := s.yt.InsertRows(ctx, tx, eventsTable, []any{newEvent}); err != nil {
+		return nil, status.Errorf(codes.Internal, "insert event fail: %v", err)
+	}
+
+	newEventKey := EventRowKey{
+		ResourceTypeCode:   event.GetResource().GetTypeCode(),
+		ResourceExternalID: event.GetResource().GetExternalId(),
+		StartTime:          uint64(event.GetStartTime().AsTime().UnixMicro()),
+		ID:                 event.GetId(),
+	}
+
+	if err := s.yt.InsertRows(ctx, tx, eventsIdUniqIndexTable, []any{newEventKey}); err != nil {
+		return nil, status.Errorf(codes.Internal, "insert event idx fail: %v", err)
+	}
+
+	ts, err = s.yt.CommitTabletTx(ctx, tx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "commit fail: %v", err)
+	}
+
+	write := make([]*writeItem, 0, 2)
+
+	write = append(write, &writeItem{
+		key: EventKey{
+			ResourceTypeCode:   event.GetResource().GetTypeCode(),
+			ResourceExternalID: event.GetResource().GetExternalId(),
+			StartTime:          event.GetStartTime().AsTime(),
+			ID:                 event.GetId(),
+			Timestamp:          ts,
+		},
+		item: newMemTableItem(event, ts, false),
+	})
+
+	if keyChanged {
+		write = append(write, &writeItem{
+			key: EventKey{
+				ResourceTypeCode:   key.ResourceTypeCode,
+				ResourceExternalID: key.ResourceExternalID,
+				StartTime:          time.UnixMicro(int64(key.StartTime)),
+				ID:                 key.ID,
+				Timestamp:          ts,
+				IsDeleted:          true,
+			},
+			item: newMemTableItem(nil, ts, true),
+		})
+	}
+
+	resCh := make(chan writeResponse, 1)
+
+	select {
+	case s.writeCh <- writeRequest{in: write, rsp: resCh}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	select {
+	case <-resCh:
+		return &storagepb.UpdateEventResponse{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *Storage) DeleteEvent(ctx context.Context, in *storagepb.DeleteEventRequest) (*storagepb.DeleteEventResponse, error) {
