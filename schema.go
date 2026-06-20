@@ -14,3 +14,7 @@ type EventRowKey struct {
 	StartTime          uint64 `yson:"start_time"`
 	ID                 string `yson:"id"`
 }
+
+type EventIndexRowKey struct {
+	ID string `yson:"id"`
+}

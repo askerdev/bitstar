@@ -40,7 +40,6 @@ type writeRequest struct {
 }
 
 type writeResponse struct {
-	err error
 }
 
 type Storage struct {
@@ -62,16 +61,6 @@ const (
 )
 
 func Open(ctx context.Context, yt *ytclient.Client) (*Storage, error) {
-	ytc, err := yt.NewHTTPClient()
-	if err != nil {
-		return nil, fmt.Errorf("create http client: %w", err)
-	}
-
-	ri, err := fromYt(ctx, ytc, eventsTable)
-	if err != nil {
-		return nil, fmt.Errorf("load index from yt: %w", err)
-	}
-
 	s := &Storage{
 		yt:            yt,
 		writeCh:       make(chan writeRequest),
@@ -82,7 +71,7 @@ func Open(ctx context.Context, yt *ytclient.Client) (*Storage, error) {
 
 	s.cur.Store(newMemTable())
 	s.pen.Store(&[]*roaringIndex{})
-	s.levels.Store(&[4]*roaringIndex{ri, nil, nil, nil})
+	s.levels.Store(&[4]*roaringIndex{nil, nil, nil, nil})
 
 	ts, err := yt.GenerateTimestamp(ctx)
 	if err != nil {
@@ -133,7 +122,8 @@ func (s *Storage) writeWorker() {
 
 		select {
 		case req := <-s.writeCh:
-			req.rsp <- writeResponse{err: s.batchCreateEvents(req.in)}
+			s.batchCreateEvents(req.in)
+			req.rsp <- writeResponse{}
 		case ri := <-s.compactDoneCh:
 			oldSlice := *s.pen.Load()
 			idx := -1
@@ -222,16 +212,15 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 	keys := make([]any, 0, len(in.GetRequests()))
 
 	for _, req := range in.GetRequests() {
-		id := uuid.Must(uuid.NewV7())
 		event := req.GetEvent()
-		event.Id = id.String()
+		event.Id = uuid.Must(uuid.NewV7()).String()
 
 		keys = append(keys,
 			EventRowKey{
 				ResourceTypeCode:   event.GetResource().GetTypeCode(),
 				ResourceExternalID: event.GetResource().GetExternalId(),
 				StartTime:          uint64(event.GetStartTime().AsTime().UnixMicro()),
-				ID:                 id.String(),
+				ID:                 event.GetId(),
 			},
 		)
 
@@ -245,7 +234,7 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 				ResourceTypeCode:   event.GetResource().GetTypeCode(),
 				ResourceExternalID: event.GetResource().GetExternalId(),
 				StartTime:          uint64(event.GetStartTime().AsTime().UnixMicro()),
-				ID:                 id.String(),
+				ID:                 event.GetId(),
 				Event:              eventBytes,
 			},
 		)
@@ -253,7 +242,7 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 		events = append(events, event)
 	}
 
-	tx, err := s.yt.StartTabletTx(ctx)
+	tx, ts, err := s.yt.StartTabletTx(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "start tx fail: %v", err)
 	}
@@ -268,7 +257,7 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 		return nil, status.Errorf(codes.Internal, "insert fail: %v", err)
 	}
 
-	ts, err := s.yt.CommitTabletTx(ctx, tx)
+	ts, err = s.yt.CommitTabletTx(ctx, tx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "commit fail: %v", err)
 	}
@@ -295,7 +284,7 @@ func (s *Storage) BatchCreateEvents(ctx context.Context, in *storagepb.BatchCrea
 	}
 }
 
-func (s *Storage) batchCreateEvents(in []*writeItem) error {
+func (s *Storage) batchCreateEvents(in []*writeItem) {
 	curTable := s.cur.Load()
 	curTable.wg.Add(1)
 
@@ -328,8 +317,6 @@ func (s *Storage) batchCreateEvents(in []*writeItem) error {
 	}
 
 	curTable.wg.Done()
-
-	return nil
 }
 
 func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsRequest) (*storagepb.ListEventsResponse, error) {
@@ -378,6 +365,9 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 	startTime := in.GetStartTime().AsTime()
 	endTime := in.GetEndTime().AsTime()
 	for _, ri := range ris {
+		if ri == nil {
+			continue
+		}
 		posting, err := ri.query(startTime, endTime, filter)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "list fail: %v", err)
@@ -389,8 +379,12 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 
 	pageSize := int(in.GetPageSize() + 1)
 	keys := make([]EventKey, 0, pageSize)
-	for i := 0; i < pageSize && iter.Next(); i++ {
-		keys = append(keys, iter.Value())
+	for len(keys) < pageSize && iter.Next() {
+		item := iter.Value()
+		if item.IsDeleted {
+			continue
+		}
+		keys = append(keys, item)
 	}
 	if len(keys) == 0 {
 		return &storagepb.ListEventsResponse{Stats: stats}, nil
@@ -449,4 +443,65 @@ func (s *Storage) ListEvents(ctx context.Context, in *storagepb.ListEventsReques
 		NextPageToken: nextPageToken,
 		Stats:         stats,
 	}, nil
+}
+
+func (s *Storage) UpdateEvent(ctx context.Context, in *storagepb.UpdateEventRequest) (*storagepb.UpdateEventResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "unimplemented")
+}
+
+func (s *Storage) DeleteEvent(ctx context.Context, in *storagepb.DeleteEventRequest) (*storagepb.DeleteEventResponse, error) {
+	tx, ts, err := s.yt.StartTabletTx(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "start tx fail: %v", err)
+	}
+
+	wireRows, nameTable, err := s.yt.LookupRows(ctx, eventsIdUniqIndexTable, []any{EventIndexRowKey{ID: in.GetId()}}, ts)
+	if err != nil || len(wireRows) != 1 {
+		return nil, status.Errorf(codes.Internal, "lookup fail: %v", err)
+	}
+
+	dec := wire.NewDecoder(nameTable, nil)
+	var key EventRowKey
+	if err := dec.UnmarshalRow(wireRows[0], &key); err != nil {
+		return nil, status.Errorf(codes.Internal, "row unmarshal fail: %v", err)
+	}
+
+	if err := s.yt.DeleteRows(ctx, tx, eventsTable, []any{key}); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete event fail: %v", err)
+	}
+
+	if err := s.yt.DeleteRows(ctx, tx, eventsIdUniqIndexTable, []any{EventIndexRowKey{ID: in.GetId()}}); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete event idx fail: %v", err)
+	}
+
+	ts, err = s.yt.CommitTabletTx(ctx, tx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "commit fail: %v", err)
+	}
+
+	eventKey := EventKey{
+		ResourceTypeCode:   key.ResourceTypeCode,
+		ResourceExternalID: key.ResourceExternalID,
+		StartTime:          time.UnixMicro(int64(key.StartTime)),
+		ID:                 key.ID,
+		Timestamp:          ts,
+		IsDeleted:          true,
+	}
+
+	resCh := make(chan writeResponse, 1)
+
+	select {
+	case s.writeCh <- writeRequest{in: []*writeItem{
+		{key: eventKey, item: newMemTableItem(nil, ts, true)},
+	}, rsp: resCh}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	select {
+	case <-resCh:
+		return &storagepb.DeleteEventResponse{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

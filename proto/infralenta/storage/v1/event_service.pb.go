@@ -9,6 +9,7 @@ package storagepb
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	fieldmaskpb "google.golang.org/protobuf/types/known/fieldmaskpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
@@ -610,11 +611,179 @@ func (x *Stats) GetLevelCardinalities() map[int32]int32 {
 	return nil
 }
 
+type UpdateEventRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Event         *Event                 `protobuf:"bytes,1,opt,name=event,proto3" json:"event,omitempty"`
+	UpdateMask    *fieldmaskpb.FieldMask `protobuf:"bytes,2,opt,name=update_mask,json=updateMask,proto3" json:"update_mask,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateEventRequest) Reset() {
+	*x = UpdateEventRequest{}
+	mi := &file_event_service_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateEventRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateEventRequest) ProtoMessage() {}
+
+func (x *UpdateEventRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_event_service_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateEventRequest.ProtoReflect.Descriptor instead.
+func (*UpdateEventRequest) Descriptor() ([]byte, []int) {
+	return file_event_service_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *UpdateEventRequest) GetEvent() *Event {
+	if x != nil {
+		return x.Event
+	}
+	return nil
+}
+
+func (x *UpdateEventRequest) GetUpdateMask() *fieldmaskpb.FieldMask {
+	if x != nil {
+		return x.UpdateMask
+	}
+	return nil
+}
+
+type UpdateEventResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateEventResponse) Reset() {
+	*x = UpdateEventResponse{}
+	mi := &file_event_service_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateEventResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateEventResponse) ProtoMessage() {}
+
+func (x *UpdateEventResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_event_service_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateEventResponse.ProtoReflect.Descriptor instead.
+func (*UpdateEventResponse) Descriptor() ([]byte, []int) {
+	return file_event_service_proto_rawDescGZIP(), []int{10}
+}
+
+type DeleteEventRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteEventRequest) Reset() {
+	*x = DeleteEventRequest{}
+	mi := &file_event_service_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteEventRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteEventRequest) ProtoMessage() {}
+
+func (x *DeleteEventRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_event_service_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteEventRequest.ProtoReflect.Descriptor instead.
+func (*DeleteEventRequest) Descriptor() ([]byte, []int) {
+	return file_event_service_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *DeleteEventRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type DeleteEventResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteEventResponse) Reset() {
+	*x = DeleteEventResponse{}
+	mi := &file_event_service_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteEventResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteEventResponse) ProtoMessage() {}
+
+func (x *DeleteEventResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_event_service_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteEventResponse.ProtoReflect.Descriptor instead.
+func (*DeleteEventResponse) Descriptor() ([]byte, []int) {
+	return file_event_service_proto_rawDescGZIP(), []int{12}
+}
+
 var File_event_service_proto protoreflect.FileDescriptor
 
 const file_event_service_proto_rawDesc = "" +
 	"\n" +
-	"\x13event_service.proto\x12\x15infralenta.storage.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x98\x05\n" +
+	"\x13event_service.proto\x12\x15infralenta.storage.v1\x1a google/protobuf/field_mask.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x98\x05\n" +
 	"\x05Event\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
 	"\x05title\x18\x02 \x01(\tR\x05title\x12 \n" +
@@ -676,11 +845,21 @@ const file_event_service_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\x1aE\n" +
 	"\x17LevelCardinalitiesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\x05R\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x012\xe9\x01\n" +
+	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\"\x85\x01\n" +
+	"\x12UpdateEventRequest\x122\n" +
+	"\x05event\x18\x01 \x01(\v2\x1c.infralenta.storage.v1.EventR\x05event\x12;\n" +
+	"\vupdate_mask\x18\x02 \x01(\v2\x1a.google.protobuf.FieldMaskR\n" +
+	"updateMask\"\x15\n" +
+	"\x13UpdateEventResponse\"$\n" +
+	"\x12DeleteEventRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x15\n" +
+	"\x13DeleteEventResponse2\xb5\x03\n" +
 	"\fEventService\x12v\n" +
 	"\x11BatchCreateEvents\x12/.infralenta.storage.v1.BatchCreateEventsRequest\x1a0.infralenta.storage.v1.BatchCreateEventsResponse\x12a\n" +
 	"\n" +
-	"ListEvents\x12(.infralenta.storage.v1.ListEventsRequest\x1a).infralenta.storage.v1.ListEventsResponseBCZAgithub.com/askerdev/bitstar/proto/infralenta/storage/v1;storagepbb\x06proto3"
+	"ListEvents\x12(.infralenta.storage.v1.ListEventsRequest\x1a).infralenta.storage.v1.ListEventsResponse\x12d\n" +
+	"\vUpdateEvent\x12).infralenta.storage.v1.UpdateEventRequest\x1a*.infralenta.storage.v1.UpdateEventResponse\x12d\n" +
+	"\vDeleteEvent\x12).infralenta.storage.v1.DeleteEventRequest\x1a*.infralenta.storage.v1.DeleteEventResponseBCZAgithub.com/askerdev/bitstar/proto/infralenta/storage/v1;storagepbb\x06proto3"
 
 var (
 	file_event_service_proto_rawDescOnce sync.Once
@@ -694,7 +873,7 @@ func file_event_service_proto_rawDescGZIP() []byte {
 	return file_event_service_proto_rawDescData
 }
 
-var file_event_service_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_event_service_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_event_service_proto_goTypes = []any{
 	(*Event)(nil),                     // 0: infralenta.storage.v1.Event
 	(*Resource)(nil),                  // 1: infralenta.storage.v1.Resource
@@ -705,39 +884,50 @@ var file_event_service_proto_goTypes = []any{
 	(*ListEventsRequest)(nil),         // 6: infralenta.storage.v1.ListEventsRequest
 	(*ListEventsResponse)(nil),        // 7: infralenta.storage.v1.ListEventsResponse
 	(*Stats)(nil),                     // 8: infralenta.storage.v1.Stats
-	nil,                               // 9: infralenta.storage.v1.Event.AnnotationsEntry
-	nil,                               // 10: infralenta.storage.v1.Stats.PendingIndexCardinalitiesEntry
-	nil,                               // 11: infralenta.storage.v1.Stats.LevelCardinalitiesEntry
-	(*timestamppb.Timestamp)(nil),     // 12: google.protobuf.Timestamp
+	(*UpdateEventRequest)(nil),        // 9: infralenta.storage.v1.UpdateEventRequest
+	(*UpdateEventResponse)(nil),       // 10: infralenta.storage.v1.UpdateEventResponse
+	(*DeleteEventRequest)(nil),        // 11: infralenta.storage.v1.DeleteEventRequest
+	(*DeleteEventResponse)(nil),       // 12: infralenta.storage.v1.DeleteEventResponse
+	nil,                               // 13: infralenta.storage.v1.Event.AnnotationsEntry
+	nil,                               // 14: infralenta.storage.v1.Stats.PendingIndexCardinalitiesEntry
+	nil,                               // 15: infralenta.storage.v1.Stats.LevelCardinalitiesEntry
+	(*timestamppb.Timestamp)(nil),     // 16: google.protobuf.Timestamp
+	(*fieldmaskpb.FieldMask)(nil),     // 17: google.protobuf.FieldMask
 }
 var file_event_service_proto_depIdxs = []int32{
 	1,  // 0: infralenta.storage.v1.Event.resource:type_name -> infralenta.storage.v1.Resource
-	12, // 1: infralenta.storage.v1.Event.start_time:type_name -> google.protobuf.Timestamp
-	12, // 2: infralenta.storage.v1.Event.end_time:type_name -> google.protobuf.Timestamp
-	9,  // 3: infralenta.storage.v1.Event.annotations:type_name -> infralenta.storage.v1.Event.AnnotationsEntry
-	12, // 4: infralenta.storage.v1.Event.create_time:type_name -> google.protobuf.Timestamp
-	12, // 5: infralenta.storage.v1.Event.update_time:type_name -> google.protobuf.Timestamp
-	12, // 6: infralenta.storage.v1.Event.delete_time:type_name -> google.protobuf.Timestamp
+	16, // 1: infralenta.storage.v1.Event.start_time:type_name -> google.protobuf.Timestamp
+	16, // 2: infralenta.storage.v1.Event.end_time:type_name -> google.protobuf.Timestamp
+	13, // 3: infralenta.storage.v1.Event.annotations:type_name -> infralenta.storage.v1.Event.AnnotationsEntry
+	16, // 4: infralenta.storage.v1.Event.create_time:type_name -> google.protobuf.Timestamp
+	16, // 5: infralenta.storage.v1.Event.update_time:type_name -> google.protobuf.Timestamp
+	16, // 6: infralenta.storage.v1.Event.delete_time:type_name -> google.protobuf.Timestamp
 	1,  // 7: infralenta.storage.v1.EventKey.resource:type_name -> infralenta.storage.v1.Resource
-	12, // 8: infralenta.storage.v1.EventKey.start_time:type_name -> google.protobuf.Timestamp
+	16, // 8: infralenta.storage.v1.EventKey.start_time:type_name -> google.protobuf.Timestamp
 	0,  // 9: infralenta.storage.v1.CreateEventRequest.event:type_name -> infralenta.storage.v1.Event
 	3,  // 10: infralenta.storage.v1.BatchCreateEventsRequest.requests:type_name -> infralenta.storage.v1.CreateEventRequest
 	0,  // 11: infralenta.storage.v1.BatchCreateEventsResponse.events:type_name -> infralenta.storage.v1.Event
-	12, // 12: infralenta.storage.v1.ListEventsRequest.start_time:type_name -> google.protobuf.Timestamp
-	12, // 13: infralenta.storage.v1.ListEventsRequest.end_time:type_name -> google.protobuf.Timestamp
+	16, // 12: infralenta.storage.v1.ListEventsRequest.start_time:type_name -> google.protobuf.Timestamp
+	16, // 13: infralenta.storage.v1.ListEventsRequest.end_time:type_name -> google.protobuf.Timestamp
 	0,  // 14: infralenta.storage.v1.ListEventsResponse.events:type_name -> infralenta.storage.v1.Event
 	8,  // 15: infralenta.storage.v1.ListEventsResponse.stats:type_name -> infralenta.storage.v1.Stats
-	10, // 16: infralenta.storage.v1.Stats.pending_index_cardinalities:type_name -> infralenta.storage.v1.Stats.PendingIndexCardinalitiesEntry
-	11, // 17: infralenta.storage.v1.Stats.level_cardinalities:type_name -> infralenta.storage.v1.Stats.LevelCardinalitiesEntry
-	4,  // 18: infralenta.storage.v1.EventService.BatchCreateEvents:input_type -> infralenta.storage.v1.BatchCreateEventsRequest
-	6,  // 19: infralenta.storage.v1.EventService.ListEvents:input_type -> infralenta.storage.v1.ListEventsRequest
-	5,  // 20: infralenta.storage.v1.EventService.BatchCreateEvents:output_type -> infralenta.storage.v1.BatchCreateEventsResponse
-	7,  // 21: infralenta.storage.v1.EventService.ListEvents:output_type -> infralenta.storage.v1.ListEventsResponse
-	20, // [20:22] is the sub-list for method output_type
-	18, // [18:20] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	14, // 16: infralenta.storage.v1.Stats.pending_index_cardinalities:type_name -> infralenta.storage.v1.Stats.PendingIndexCardinalitiesEntry
+	15, // 17: infralenta.storage.v1.Stats.level_cardinalities:type_name -> infralenta.storage.v1.Stats.LevelCardinalitiesEntry
+	0,  // 18: infralenta.storage.v1.UpdateEventRequest.event:type_name -> infralenta.storage.v1.Event
+	17, // 19: infralenta.storage.v1.UpdateEventRequest.update_mask:type_name -> google.protobuf.FieldMask
+	4,  // 20: infralenta.storage.v1.EventService.BatchCreateEvents:input_type -> infralenta.storage.v1.BatchCreateEventsRequest
+	6,  // 21: infralenta.storage.v1.EventService.ListEvents:input_type -> infralenta.storage.v1.ListEventsRequest
+	9,  // 22: infralenta.storage.v1.EventService.UpdateEvent:input_type -> infralenta.storage.v1.UpdateEventRequest
+	11, // 23: infralenta.storage.v1.EventService.DeleteEvent:input_type -> infralenta.storage.v1.DeleteEventRequest
+	5,  // 24: infralenta.storage.v1.EventService.BatchCreateEvents:output_type -> infralenta.storage.v1.BatchCreateEventsResponse
+	7,  // 25: infralenta.storage.v1.EventService.ListEvents:output_type -> infralenta.storage.v1.ListEventsResponse
+	10, // 26: infralenta.storage.v1.EventService.UpdateEvent:output_type -> infralenta.storage.v1.UpdateEventResponse
+	12, // 27: infralenta.storage.v1.EventService.DeleteEvent:output_type -> infralenta.storage.v1.DeleteEventResponse
+	24, // [24:28] is the sub-list for method output_type
+	20, // [20:24] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_event_service_proto_init() }
@@ -751,7 +941,7 @@ func file_event_service_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_event_service_proto_rawDesc), len(file_event_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

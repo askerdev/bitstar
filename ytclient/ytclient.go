@@ -114,7 +114,7 @@ func (c *Client) GenerateTimestamp(ctx context.Context) (uint64, error) {
 }
 
 // StartTabletTx starts a sticky tablet transaction pinned to one proxy.
-func (c *Client) StartTabletTx(ctx context.Context) (guid.GUID, error) {
+func (c *Client) StartTabletTx(ctx context.Context) (guid.GUID, uint64, error) {
 	txType := rpc_proxy.ETransactionType_TT_TABLET
 	sticky := true
 	req := &rpc_proxy.TReqStartTransaction{
@@ -124,9 +124,9 @@ func (c *Client) StartTabletTx(ctx context.Context) (guid.GUID, error) {
 	var rsp rpc_proxy.TRspStartTransaction
 	if err := c.conn.Send(ctx, "ApiService", "StartTransaction", req, &rsp,
 		bus.WithToken(c.token)); err != nil {
-		return guid.GUID{}, err
+		return guid.GUID{}, 0, err
 	}
-	return misc.NewGUIDFromProto(rsp.GetId()), nil
+	return misc.NewGUIDFromProto(rsp.GetId()), rsp.GetStartTimestamp(), nil
 }
 
 // CommitTabletTx commits the transaction and returns PrimaryCommitTimestamp.
@@ -166,6 +166,33 @@ func (c *Client) InsertRows(ctx context.Context, txID guid.GUID, path string, ro
 	modTypes := make([]rpc_proxy.ERowModificationType, len(rows))
 	for i := range modTypes {
 		modTypes[i] = rpc_proxy.ERowModificationType_RMT_WRITE
+	}
+
+	req := &rpc_proxy.TReqModifyRows{
+		TransactionId:        misc.NewProtoFromGUID(txID),
+		Path:                 []byte(path),
+		RowModificationTypes: modTypes,
+		RowsetDescriptor:     buildDescriptor(nameTable),
+	}
+	var rsp rpc_proxy.TRspModifyRows
+	return c.conn.Send(ctx, "ApiService", "ModifyRows", req, &rsp,
+		bus.WithToken(c.token),
+		bus.WithAttachments(data))
+}
+
+func (c *Client) DeleteRows(ctx context.Context, txID guid.GUID, path string, rows []any) error {
+	nameTable, wireRows, err := wire.Encode(rows)
+	if err != nil {
+		return err
+	}
+	data, err := wire.MarshalRowset(wireRows)
+	if err != nil {
+		return err
+	}
+
+	modTypes := make([]rpc_proxy.ERowModificationType, len(rows))
+	for i := range modTypes {
+		modTypes[i] = rpc_proxy.ERowModificationType_RMT_DELETE
 	}
 
 	req := &rpc_proxy.TReqModifyRows{
@@ -226,7 +253,6 @@ func (c *Client) LookupRows(ctx context.Context, path string, keys []any, timest
 
 	return rows, rspNameTable, nil
 }
-
 
 func buildDescriptor(nameTable wire.NameTable) *rpc_proxy.TRowsetDescriptor {
 	kind := rpc_proxy.ERowsetKind_RK_UNVERSIONED

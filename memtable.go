@@ -18,17 +18,19 @@ type memTableItem struct {
 
 func newMemTableItem(event *storagepb.Event, ts uint64, isDeleted bool) *memTableItem {
 	item := &memTableItem{
-		event:       event,
 		tags:        bloom.NewWithEstimates(50, 0.01),
 		annotations: bloom.NewWithEstimates(50, 0.01),
 		ts:          ts,
 		isDeleted:   isDeleted,
 	}
-	for _, tag := range event.Tags {
-		item.tags.AddString(tag)
-	}
-	for k, v := range event.Annotations {
-		item.annotations.AddString(k + "_" + v)
+	if event != nil {
+		item.event = event
+		for _, tag := range event.Tags {
+			item.tags.AddString(tag)
+		}
+		for k, v := range event.Annotations {
+			item.annotations.AddString(k + "_" + v)
+		}
 	}
 	return item
 }
