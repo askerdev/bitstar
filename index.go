@@ -230,41 +230,11 @@ func fromYt(ctx context.Context, ytc yt.Client, tablePath string) (*roaringIndex
 func fromMemTable(mt *memTable) *roaringIndex {
 	ri := newRoaringIndex()
 
-	// for elem := mt.items.Front(); elem != nil; elem = elem.Next() {
-	// 	key := elem.Key().(EventKey)
-	// 	val := elem.Value.(*memTableItem)
-	// }
-
-	// slices.SortFunc(mt.items, func(a, b *memTableItem) int {
-	// 	timeA := a.event.StartTime.AsTime()
-	// 	timeB := b.event.StartTime.AsTime()
-	// 	if timeA.After(timeB) {
-	// 		return -1
-	// 	}
-	// 	if timeA.Before(timeB) {
-	// 		return 1
-	// 	}
-	// 	if b.event.Id > a.event.Id {
-	// 		return 1
-	// 	}
-	// 	if b.event.Id < a.event.Id {
-	// 		return -1
-	// 	}
-	// 	if a.ts < b.ts {
-	// 		return -1
-	// 	}
-	// 	if a.ts > b.ts {
-	// 		return 1
-	// 	}
-	// 	return 0
-	// })
-
-	// for i, item := range mt.items {
-	// 	if i < len(mt.items)-1 && item.event.Id == mt.items[i+1].event.Id {
-	// 		continue
-	// 	}
-	// 	indexEvent(ri, item.event, item.ts, item.isDeleted)
-	// }
+	for elem := mt.items.Front(); elem != nil; elem = elem.Next() {
+		key := elem.Key().(EventKey)
+		val := elem.Value.(*memTableItem)
+		indexEvent(ri, val.event, key.Timestamp, key.IsDeleted)
+	}
 
 	return ri
 }
