@@ -3,11 +3,16 @@ package main
 import (
 	"context"
 
+	"go.ytsaurus.tech/library/go/ptr"
 	"go.ytsaurus.tech/yt/go/schema"
 	"go.ytsaurus.tech/yt/go/ypath"
 	"go.ytsaurus.tech/yt/go/yt"
 	"go.ytsaurus.tech/yt/go/yt/ythttp"
 	"go.ytsaurus.tech/yt/go/yterrors"
+)
+
+const (
+	initialTabletCount = 128
 )
 
 func main() {
@@ -71,6 +76,13 @@ func main() {
 		panic(err)
 	}
 
+	err = yc.ReshardTable(ctx, ypath.Path("//home/events"), &yt.ReshardTableOptions{
+		TabletCount: ptr.Int(initialTabletCount),
+	})
+	if err != nil {
+		panic(err)
+	}
+
 	_, err = yt.CreateTable(
 		ctx,
 		yc,
@@ -115,6 +127,13 @@ func main() {
 		}),
 	)
 	if err != nil && !yterrors.ContainsErrorCode(err, yterrors.CodeAlreadyExists) {
+		panic(err)
+	}
+
+	err = yc.ReshardTable(ctx, ypath.Path("//home/events_id_uniq_idx"), &yt.ReshardTableOptions{
+		TabletCount: ptr.Int(initialTabletCount),
+	})
+	if err != nil {
 		panic(err)
 	}
 }

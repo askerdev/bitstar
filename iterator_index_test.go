@@ -2,6 +2,7 @@ package bitstar
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -20,75 +21,152 @@ func TestIteratorIndex(t *testing.T) {
 		uuid.Must(uuid.NewV7()).String(),
 	}
 
+	type item struct {
+		event     *storagepb.Event
+		timestamp uint64
+	}
+
+	type out struct {
+		id        string
+		timestamp uint64
+	}
+
 	tc := []struct {
-		events []*storagepb.Event
-		seek   *EventKey
-		filter string
-		want   []string
+		events    []item
+		seek      *EventKey
+		filter    string
+		timestamp uint64
+		want      []out
 	}{
 		{
-			events: []*storagepb.Event{
+			events: []item{
 				{
-					Id:          ids[0],
-					StartTime:   timestamppb.New(now),
-					EndTime:     timestamppb.New(now.Add(time.Hour)),
-					Tags:        []string{"go", "backend"},
-					Annotations: map[string]string{"env": "prod"},
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
+					},
+					timestamp: 1,
+				},
+			},
+			timestamp: 1,
+			filter:    `tags = "go"`,
+			want:      []out{{ids[0], 1}},
+		},
+		{
+			events: []item{
+				{
+					event: &storagepb.Event{
+						Id:          ids[1],
+						StartTime:   timestamppb.New(now.Add(-time.Hour)),
+						EndTime:     timestamppb.New(now),
+						Tags:        []string{"go"},
+						Annotations: map[string]string{"env": "dev"},
+					},
 				},
 				{
-					Id:          ids[1],
-					StartTime:   timestamppb.New(now.Add(-time.Hour)),
-					EndTime:     timestamppb.New(now),
-					Tags:        []string{"go"},
-					Annotations: map[string]string{"env": "dev"},
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
+					},
+					timestamp: 1,
+				},
+				{
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
+					},
+				},
+			},
+			timestamp: 1,
+			filter:    `tags = "go"`,
+			want:      []out{{ids[0], 1}, {ids[1], 0}},
+		},
+		{
+			events: []item{
+				{
+					event: &storagepb.Event{
+						Id:          ids[1],
+						StartTime:   timestamppb.New(now.Add(-time.Hour)),
+						EndTime:     timestamppb.New(now),
+						Tags:        []string{"go"},
+						Annotations: map[string]string{"env": "dev"},
+					},
+				},
+				{
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
+					},
+					timestamp: 1,
+				},
+				{
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
+					},
 				},
 			},
 			filter: `tags = "go"`,
-			want:   []string{ids[0], ids[1]},
+			want:   []out{{ids[0], 0}, {ids[1], 0}},
 		},
 		{
-			events: []*storagepb.Event{
+			events: []item{
 				{
-					Id:          ids[0],
-					StartTime:   timestamppb.New(now),
-					EndTime:     timestamppb.New(now.Add(time.Hour)),
-					Tags:        []string{"go", "backend"},
-					Annotations: map[string]string{"env": "prod"},
+					event: &storagepb.Event{
+						Id:          ids[1],
+						StartTime:   timestamppb.New(now.Add(-time.Hour)),
+						EndTime:     timestamppb.New(now),
+						Tags:        []string{"go"},
+						Annotations: map[string]string{"env": "dev"},
+					},
 				},
 				{
-					Id:          ids[1],
-					StartTime:   timestamppb.New(now.Add(-time.Hour)),
-					EndTime:     timestamppb.New(now),
-					Tags:        []string{"go"},
-					Annotations: map[string]string{"env": "dev"},
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
+					},
 				},
 			},
 			filter: `tags = "backend"`,
-			want:   []string{ids[0]},
+			want:   []out{{ids[0], 0}},
 		},
 		{
-			events: []*storagepb.Event{
+			events: []item{
 				{
-					Id: ids[0],
-					Resource: &storagepb.Resource{
-						TypeCode:   "abc_application",
-						ExternalId: ids[0],
+					event: &storagepb.Event{
+						Id:          ids[1],
+						StartTime:   timestamppb.New(now.Add(-time.Hour)),
+						EndTime:     timestamppb.New(now),
+						Tags:        []string{"go"},
+						Annotations: map[string]string{"env": "dev"},
 					},
-					StartTime:   timestamppb.New(now),
-					EndTime:     timestamppb.New(now.Add(time.Hour)),
-					Tags:        []string{"go", "backend"},
-					Annotations: map[string]string{"env": "prod"},
 				},
 				{
-					Id: ids[1],
-					Resource: &storagepb.Resource{
-						TypeCode:   "abc_application",
-						ExternalId: ids[1],
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
 					},
-					StartTime:   timestamppb.New(now.Add(-time.Hour)),
-					EndTime:     timestamppb.New(now),
-					Tags:        []string{"go"},
-					Annotations: map[string]string{"env": "dev"},
 				},
 			},
 			seek: &EventKey{
@@ -98,31 +176,27 @@ func TestIteratorIndex(t *testing.T) {
 				ID:                 ids[0],
 			},
 			filter: `tags = "go"`,
-			want:   []string{ids[0], ids[1]},
+			want:   []out{{ids[0], 0}, {ids[1], 0}},
 		},
 		{
-			events: []*storagepb.Event{
+			events: []item{
 				{
-					Id: ids[0],
-					Resource: &storagepb.Resource{
-						TypeCode:   "abc_application",
-						ExternalId: ids[0],
+					event: &storagepb.Event{
+						Id:          ids[1],
+						StartTime:   timestamppb.New(now.Add(-time.Hour)),
+						EndTime:     timestamppb.New(now),
+						Tags:        []string{"go"},
+						Annotations: map[string]string{"env": "dev"},
 					},
-					StartTime:   timestamppb.New(now),
-					EndTime:     timestamppb.New(now.Add(time.Hour)),
-					Tags:        []string{"go", "backend"},
-					Annotations: map[string]string{"env": "prod"},
 				},
 				{
-					Id: ids[1],
-					Resource: &storagepb.Resource{
-						TypeCode:   "abc_application",
-						ExternalId: ids[1],
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
 					},
-					StartTime:   timestamppb.New(now.Add(-time.Hour)),
-					EndTime:     timestamppb.New(now),
-					Tags:        []string{"go"},
-					Annotations: map[string]string{"env": "dev"},
 				},
 			},
 			seek: &EventKey{
@@ -132,31 +206,27 @@ func TestIteratorIndex(t *testing.T) {
 				ID:                 ids[1],
 			},
 			filter: `tags = "go"`,
-			want:   []string{ids[1]},
+			want:   []out{{ids[1], 0}},
 		},
 		{
-			events: []*storagepb.Event{
+			events: []item{
 				{
-					Id: ids[0],
-					Resource: &storagepb.Resource{
-						TypeCode:   "abc_application",
-						ExternalId: ids[0],
+					event: &storagepb.Event{
+						Id:          ids[1],
+						StartTime:   timestamppb.New(now.Add(-time.Hour)),
+						EndTime:     timestamppb.New(now),
+						Tags:        []string{"go"},
+						Annotations: map[string]string{"env": "dev"},
 					},
-					StartTime:   timestamppb.New(now),
-					EndTime:     timestamppb.New(now.Add(time.Hour)),
-					Tags:        []string{"go", "backend"},
-					Annotations: map[string]string{"env": "prod"},
 				},
 				{
-					Id: ids[1],
-					Resource: &storagepb.Resource{
-						TypeCode:   "abc_application",
-						ExternalId: ids[1],
+					event: &storagepb.Event{
+						Id:          ids[0],
+						StartTime:   timestamppb.New(now),
+						EndTime:     timestamppb.New(now.Add(time.Hour)),
+						Tags:        []string{"go", "backend"},
+						Annotations: map[string]string{"env": "prod"},
 					},
-					StartTime:   timestamppb.New(now.Add(-time.Hour)),
-					EndTime:     timestamppb.New(now),
-					Tags:        []string{"go"},
-					Annotations: map[string]string{"env": "dev"},
 				},
 			},
 			seek: &EventKey{
@@ -166,26 +236,49 @@ func TestIteratorIndex(t *testing.T) {
 				ID:                 ids[1],
 			},
 			filter: `tags = "go"`,
-			want:   []string{},
+			want:   []out{},
 		},
 	}
 
 	for i, tt := range tc {
 		t.Run(fmt.Sprintf("#%d", i), func(t *testing.T) {
-			ri := riFromEvents(t, tt.events)
+			ri := newRoaringIndex()
+
+			slices.SortFunc(tt.events, func(itemA, itemB item) int {
+				a, b := EventKey{
+					ResourceTypeCode:   itemA.event.GetResource().GetTypeCode(),
+					ResourceExternalID: itemA.event.GetResource().GetExternalId(),
+					StartTime:          itemA.event.GetStartTime().AsTime(),
+					ID:                 itemA.event.GetId(),
+					Timestamp:          itemA.timestamp,
+					IsDeleted:          false,
+				}, EventKey{
+					ResourceTypeCode:   itemB.event.GetResource().GetTypeCode(),
+					ResourceExternalID: itemB.event.GetResource().GetExternalId(),
+					StartTime:          itemB.event.GetStartTime().AsTime(),
+					ID:                 itemB.event.GetId(),
+					Timestamp:          itemB.timestamp,
+					IsDeleted:          false,
+				}
+				return compareEventKeyTimestamp(a, b)
+			})
+
+			for _, item := range tt.events {
+				indexEvent(ri, item.event, item.timestamp, false)
+			}
 
 			posting, err := ri.query(now, now, parseFilter(t, tt.filter))
 			require.NoError(t, err)
 
-			got := []string{}
+			got := []out{}
 
-			iter := NewIndexIterator(ri, posting, 0)
+			iter := NewIndexIterator(ri, posting, tt.timestamp)
 			if tt.seek != nil {
 				iter.Seek(*tt.seek)
 			}
 
 			for iter.Next() {
-				got = append(got, iter.Value().ID)
+				got = append(got, out{iter.Value().ID, iter.Value().Timestamp})
 			}
 
 			assert.Equal(t, tt.want, got)

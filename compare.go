@@ -45,3 +45,31 @@ func compareEventKey(a, b EventKey) int {
 
 	return 0
 }
+
+func compareEventKeyTimestamp(a, b EventKey) int {
+	if a.StartTime.After(b.StartTime) {
+		return -1
+	}
+
+	if a.StartTime.Before(b.StartTime) {
+		return 1
+	}
+
+	if a.ID > b.ID {
+		return -1
+	}
+
+	if a.ID < b.ID {
+		return 1
+	}
+
+	if a.Timestamp < b.Timestamp {
+		return 1
+	}
+
+	if a.Timestamp > b.Timestamp {
+		return -1
+	}
+
+	return 0
+}

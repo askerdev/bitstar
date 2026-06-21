@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -56,24 +55,6 @@ func newRoaringIndex() *roaringIndex {
 		annotations: make(map[Pair]*roaring.Bitmap),
 		indexes:     make(map[EventKey]uint32),
 	}
-}
-
-func (ri *roaringIndex) nextMax(key EventKey) (uint32, bool) {
-	idx, found := slices.BinarySearchFunc(ri.keys, key, func(target, key EventKey) int {
-		return compareEventKey(key, target)
-	})
-
-	if found {
-		idx++
-	} else if idx == 0 {
-		return 0, true
-	}
-
-	if idx >= len(ri.keys) {
-		return 0, false
-	}
-
-	return uint32(idx), true
 }
 
 func (ri *roaringIndex) query(
@@ -248,6 +229,11 @@ func fromYt(ctx context.Context, ytc yt.Client, tablePath string) (*roaringIndex
 
 func fromMemTable(mt *memTable) *roaringIndex {
 	ri := newRoaringIndex()
+
+	// for elem := mt.items.Front(); elem != nil; elem = elem.Next() {
+	// 	key := elem.Key().(EventKey)
+	// 	val := elem.Value.(*memTableItem)
+	// }
 
 	// slices.SortFunc(mt.items, func(a, b *memTableItem) int {
 	// 	timeA := a.event.StartTime.AsTime()
