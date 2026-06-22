@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	initialTabletCount = 128
+	initialTabletCount = 1024
 )
 
 func main() {

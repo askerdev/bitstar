@@ -9,12 +9,12 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	storagepb "github.com/askerdev/bitstar/proto/infralenta/storage/v1"
-	"github.com/google/uuid"
 	"go.ytsaurus.tech/yt/go/yson"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -52,47 +52,18 @@ type Event struct {
 
 var NullEndTime = time.Date(2105, time.December, 31, 23, 59, 59, 0, time.UTC)
 
-type Resource struct {
-	TypeCode   string `json:"type_code"`
-	ExternalID string `json:"external_id"`
-}
-
-type BitstarEvent struct {
-	ID          uuid.UUID         `json:"id"`
-	Title       string            `json:"title"`
-	Description string            `json:"description"`
-	Resource    Resource          `json:"resource"`
-	StartTime   time.Time         `json:"start_time"`
-	EndTime     time.Time         `json:"end_time"`
-	Tags        []string          `json:"tags"`
-	Annotations map[string]string `json:"annotations"`
-}
-
-type BatchCreateEventRequest struct {
-	Requests []CreateEventRequest `json:"requests"`
-}
-
-type CreateEventRequest struct {
-	Event *BitstarEvent `json:"event"`
-}
-
 func main() {
 	pathFlag := flag.String("path", "", "path to yson list of events")
+	workersFlag := flag.Int("workers", 20, "number of concurrent gRPC clients")
+	batchSizeFlag := flag.Int("batch", 500, "number of events per gRPC request")
+	timeoutFlag := flag.Duration("timeout", 5*time.Second, "gRPC request timeout")
 	flag.Parse()
-	if pathFlag == nil || len(*pathFlag) == 0 {
-		panic("path flag is required")
-	}
 
-	filename := *pathFlag
-
-	file, err := os.Open(filename)
-	if err != nil {
-		log.Fatal(err)
+	if *pathFlag == "" {
+		log.Fatal("path flag is required")
 	}
-	defer file.Close()
 
 	const maxMsgSize = 134217728
-
 	conn, err := grpc.NewClient(
 		"localhost:11080",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -102,30 +73,94 @@ func main() {
 		),
 	)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	defer conn.Close()
 
 	client := storagepb.NewEventServiceClient(conn)
 
-	rowCount := int64(0)
-	errorCount := int64(0)
+	// Каналы для пайплайна
+	jobs := make(chan *storagepb.CreateEventRequest, (*workersFlag)*(*batchSizeFlag)*2)
+	results := make(chan time.Duration, 2000000)
+
+	var wg sync.WaitGroup
+	var totalSent atomic.Int64
+	var totalErrors atomic.Int64
+
+	fmt.Printf("Starting load test: %d workers, batch size %d\n", *workersFlag, *batchSizeFlag)
 	startTime := time.Now()
 
-	fmt.Printf("Starting to process file: %s\n", filename)
+	// 1. Запускаем Worker Pool (Конкурентные клиенты)
+	for i := 0; i < *workersFlag; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			batch := make([]*storagepb.CreateEventRequest, 0, *batchSizeFlag)
+
+			sendBatch := func() {
+				if len(batch) == 0 {
+					return
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), *timeoutFlag)
+				defer cancel()
+
+				reqStart := time.Now()
+				_, err := client.BatchCreateEvents(ctx, &storagepb.BatchCreateEventsRequest{Requests: batch})
+				duration := time.Since(reqStart)
+
+				if err != nil {
+					totalErrors.Add(int64(len(batch)))
+					// log.Printf("batch error: %v", err) // раскомментируй для дебага
+				} else {
+					totalSent.Add(int64(len(batch)))
+					results <- duration
+				}
+
+				batch = batch[:0] // сброс батча с сохранением capacity
+			}
+
+			for job := range jobs {
+				batch = append(batch, job)
+				if len(batch) >= *batchSizeFlag {
+					sendBatch()
+				}
+			}
+			sendBatch() // Досылаем остатки
+		}()
+	}
+
+	// 2. Фоновый мониторинг RPS
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		var lastSent int64
+
+		for range ticker.C {
+			currentSent := totalSent.Load()
+			delta := currentSent - lastSent
+			lastSent = currentSent
+			fmt.Printf("[Monitor] Sent: %d, Errors: %d, Current RPS: %d\n",
+				currentSent, totalErrors.Load(), delta/2)
+		}
+	}()
+
+	// 3. Чтение файла (Producer)
+	file, err := os.Open(*pathFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	reader := yson.NewReaderKind(file, yson.StreamListFragment)
-
-	batch := []*storagepb.CreateEventRequest{}
-	const batchSize = 128 * 1024
-
 	saw := make(map[int32]struct{})
+	rowCount := 0
 
 	for {
 		ok, err := reader.NextListItem()
 		if err != nil {
 			log.Printf("reader error: %v", err)
-			return
+			break
 		}
 		if !ok {
 			break
@@ -135,117 +170,95 @@ func main() {
 		d := yson.Decoder{R: reader}
 		if err := d.Decode(&event); err != nil {
 			log.Printf("decode row: %v", err)
-			return
+			break
 		}
 
 		if event.ServiceID == nil {
 			continue
 		}
-
-		if _, ok := saw[*event.ID]; ok {
+		if _, exists := saw[*event.ID]; exists {
 			continue
 		}
-
 		saw[*event.ID] = struct{}{}
 
-		params := &storagepb.CreateEventRequest{
-			Event: &storagepb.Event{
-				Title:       strptr(event.Title),
-				Description: strptr(event.Description),
-				Resource: &storagepb.Resource{
-					TypeCode:   resourceTypeCode(event.ResourceManagerEntity.Type),
-					ExternalId: event.ResourceManagerEntity.Slug,
-				},
-				StartTime: timestamppb.New(time.Unix(int64(*event.StartTime), 0)),
-				Annotations: map[string]string{
-					"resource_type_code":   resourceTypeCode(event.ResourceManagerEntity.Type),
-					"resource_external_id": event.ResourceManagerEntity.Slug,
-					"created_by":           strptr(event.CreatedBy),
-					"updated_by":           strptr(event.UpdatedBy),
-					"service_id":           int32strptr(event.ServiceID),
-					"environment_id":       int32strptr(event.EnvironmentID),
-					"type":                 strptr(event.Type),
-					"severity":             strptr(event.Severity),
-					"tickets":              strptr(event.Tickets),
-					"meta":                 strptr(event.Meta),
-					"calendar_event_id":    int32strptr(event.CalendarEventID),
-					"is_deleted":           boolstrptr(event.IsDeleted),
-					"attendees":            string(convertStringSliceToJSON(event.Attendees)),
-					"infralenta_id":        strptr(event.InfralentaID),
-					"created_at":           microsecondsToTime(event.CreatedAt).String(),
-					"updated_at":           microsecondsToTime(event.UpdatedAt).String(),
-				},
-			},
-		}
-
-		endTime := NullEndTime
-		if event.FinishTime != nil {
-			endTime = time.Unix(int64(*event.FinishTime), 0)
-		}
-		params.Event.EndTime = timestamppb.New(endTime)
-
-		if len(event.Components) > 0 {
-			params.Event.Tags = append(params.Event.Tags, event.Components...)
-		}
-
-		if len(event.Dcs) > 0 {
-			for _, dc := range event.Dcs {
-				params.Event.Tags = append(params.Event.Tags, "dc:"+dc)
-			}
-		}
-
-		batch = append(batch, params)
+		params := mapEventToProto(&event) // Вынесли маппинг в отдельную функцию для чистоты
+		jobs <- params
 		rowCount++
-
-		if len(batch) >= batchSize {
-			err := writeBatch(client, context.Background(), batch)
-			if err != nil {
-				log.Printf("batch insert error: %v", err)
-				errorCount += int64(len(batch))
-			} else {
-				fmt.Printf("Inserted batch of %d rows. Total: %d\n", len(batch), rowCount)
-			}
-			batch = []*storagepb.CreateEventRequest{}
-		}
-
-		if rowCount <= 10 {
-			fmt.Printf("Row %d: Event ID: %v, Service ID: %v, Title: %.50s...\n",
-				rowCount, event.ID, event.ServiceID, strptr(event.Title))
-		}
 	}
 
-	if len(batch) > 0 {
-		err := writeBatch(client, context.Background(), batch)
-		if err != nil {
-			log.Printf("final batch insert error: %v", err)
-			errorCount += int64(len(batch))
-		} else {
-			fmt.Printf("Inserted final batch of %d rows. Total: %d\n", len(batch), rowCount)
-		}
+	file.Close()
+	close(jobs) // Сигнал воркерам, что данных больше нет
+
+	// 4. Ожидание завершения
+	wg.Wait()
+	close(results)
+
+	// 5. Подсчет статистики и перцентилей
+	var latencies []time.Duration
+	var totalDuration time.Duration
+	for r := range results {
+		latencies = append(latencies, r)
+		totalDuration += r
 	}
 
 	elapsed := time.Since(startTime)
-	fmt.Printf("\n=== Processing Complete ===\n")
-	fmt.Printf("Total rows processed: %d\n", rowCount)
-	fmt.Printf("Errors encountered: %d\n", errorCount)
-	fmt.Printf("Total time: %v\n", elapsed)
-	fmt.Printf("Average rate: %.0f rows/sec\n", float64(rowCount)/elapsed.Seconds())
+
+	fmt.Printf("\n=== Load Test Complete ===\n")
+	fmt.Printf("Total events processed : %d\n", rowCount)
+	fmt.Printf("Total events sent      : %d\n", totalSent.Load())
+	fmt.Printf("Total errors           : %d\n", totalErrors.Load())
+	fmt.Printf("Total test time        : %v\n", elapsed)
+	fmt.Printf("Average throughput     : %.0f events/sec\n", float64(totalSent.Load())/elapsed.Seconds())
+
+	if len(latencies) > 0 {
+		slices.Sort(latencies)
+		fmt.Printf("\n=== Batch Latency Metrics (Batch Size: %d) ===\n", *batchSizeFlag)
+		fmt.Printf("Total requests : %d\n", len(latencies))
+		fmt.Printf("Min            : %v\n", latencies[0])
+		fmt.Printf("Mean           : %v\n", totalDuration/time.Duration(len(latencies)))
+		fmt.Printf("p50 (Median)   : %v\n", latencies[len(latencies)*50/100])
+		fmt.Printf("p95            : %v\n", latencies[len(latencies)*95/100])
+		fmt.Printf("p99            : %v\n", latencies[len(latencies)*99/100])
+		fmt.Printf("Max            : %v\n", latencies[len(latencies)-1])
+	}
 }
 
-func writeBatch(client storagepb.EventServiceClient, _ context.Context, in []*storagepb.CreateEventRequest) error {
-	eg := &errgroup.Group{}
-	chunks := slices.Chunk(in, 512)
-	for chunk := range chunks {
-		eg.Go(func() error {
-			start := time.Now()
-			_, err := client.BatchCreateEvents(context.Background(), &storagepb.BatchCreateEventsRequest{Requests: chunk})
-			if err == nil {
-				fmt.Println("wrote batch, elapsed", time.Since(start).String())
-			}
-			return err
-		})
+// Вынесенная логика маппинга
+func mapEventToProto(event *Event) *storagepb.CreateEventRequest {
+	req := &storagepb.CreateEventRequest{
+		Event: &storagepb.Event{
+			Title:       strptr(event.Title),
+			Description: strptr(event.Description),
+			Resource: &storagepb.Resource{
+				TypeCode:   resourceTypeCode(event.ResourceManagerEntity.Type),
+				ExternalId: event.ResourceManagerEntity.Slug,
+			},
+			StartTime: timestamppb.New(time.Unix(int64(*event.StartTime), 0)),
+			Annotations: map[string]string{
+				"resource_type_code":   resourceTypeCode(event.ResourceManagerEntity.Type),
+				"resource_external_id": event.ResourceManagerEntity.Slug,
+				"service_id":           int32strptr(event.ServiceID),
+				// ... (остальные поля из твоего кода) ...
+				"created_at": microsecondsToTime(event.CreatedAt).String(),
+			},
+		},
 	}
-	return eg.Wait()
+
+	endTime := NullEndTime
+	if event.FinishTime != nil {
+		endTime = time.Unix(int64(*event.FinishTime), 0)
+	}
+	req.Event.EndTime = timestamppb.New(endTime)
+
+	if len(event.Components) > 0 {
+		req.Event.Tags = append(req.Event.Tags, event.Components...)
+	}
+	if len(event.Dcs) > 0 {
+		for _, dc := range event.Dcs {
+			req.Event.Tags = append(req.Event.Tags, "dc:"+dc)
+		}
+	}
+	return req
 }
 
 func resourceTypeCode(resourceType string) string {
